@@ -5,14 +5,21 @@ MOCEAN auth: Bearer token in the Authorization header.
 Endpoint:    https://rest.moceanapi.com/rest/2/sms
 Body format: application/x-www-form-urlencoded
 
-Phase A6 (stub mode)  → MOCEAN_API_TOKEN not set, logs the SMS locally
-Phase A7 (real mode)  → MOCEAN_API_TOKEN is set, sends real SMS
+Two modes:
+  - Stub mode  → MOCEAN_API_TOKEN not set, logs the SMS locally
+  - Live mode  → MOCEAN_API_TOKEN is set, sends real SMS
+
+Encoding notes:
+  PH carriers often mangle non-ASCII characters (emojis, accented letters)
+  into "?". The message body must be PLAIN ASCII to survive GSM-7 encoding.
+  This module guarantees that all output is 7-bit safe.
 """
 
 import os
 from typing import Any, Dict
 
 
+# Human-readable labels for incident types
 TYPE_LABELS = {
     "flat_tire":       "Flat Tire",
     "battery":         "Dead Battery",
@@ -26,85 +33,102 @@ TYPE_LABELS = {
 }
 
 
+def _ascii_safe(text: str) -> str:
+    """
+    Force a string into GSM-7 safe ASCII.
+
+    Replaces common unicode punctuation with ASCII equivalents
+    (em dash → hyphen, smart quotes → straight quotes, ellipsis → dots)
+    and drops anything else that can't be encoded.
+    """
+    if not text:
+        return ""
+    replacements = {
+        "\u2018": "'", "\u2019": "'",   # smart single quotes
+        "\u201c": '"', "\u201d": '"',   # smart double quotes
+        "\u2013": "-", "\u2014": "-",   # en/em dash
+        "\u2026": "...",                # ellipsis
+        "\u00a0": " ",                  # non-breaking space
+        "\u2022": "*",                  # bullet
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+
+    # Drop everything outside printable ASCII
+    return "".join(c if 32 <= ord(c) < 127 else "" for c in text)
+
+
 def build_incident_sms(incident: dict, barangay: str) -> str:
     """
-    Format a structured SMS alert for the responder.
+    Format a formal dispatch SMS for the responder.
 
-    Layout uses emoji prefixes for fast visual scanning:
-      🚨 header
-      🛞 / 💥 / ⚠️  incident type + severity
-      📍 location
-      🚗 detected vehicles
-      📝 citizen description (truncated)
-      ID short ID for acknowledgment matching
-      Reply hint
+    Design constraints:
+      - PLAIN ASCII ONLY. Emojis and unicode symbols render as "?" on
+        many PH carriers (UCS-2 encoding issue). All content must survive
+        GSM-7 encoding.
+      - Structured like an emergency dispatch notice — labels aligned,
+        sections separated by blank lines.
+      - Includes a reference code so the responder can reply "YES <ref>"
+        to acknowledge the correct incident when multiple are active.
+      - Includes citizen contact so the responder can reach them directly.
 
-    Target length: under 300 chars to stay in 2 SMS segments.
+    Target length: under 320 chars (~2 SMS segments).
     """
-    TYPE_ICONS = {
-        "flat_tire":       "🛞",
-        "battery":         "🔋",
-        "fuel":            "⛽",
-        "stalled_vehicle": "🛑",
-        "minor_collision": "🚗",
-        "major_collision": "💥",
-        "vehicle_fire":    "🔥",
-        "road_hazard":     "⚠️",
-        "other":           "❓",
-    }
-
-    SEVERITY_ICONS = {
-        "low":      "·",
-        "medium":   "••",
-        "high":     "•••",
-        "critical": "••••",
-    }
+    short_id = (incident.get("id") or "")[:6].upper()
 
     incident_type = incident.get("type", "other")
     label = TYPE_LABELS.get(incident_type, "Incident")
-    icon = TYPE_ICONS.get(incident_type, "❓")
 
-    # Severity from ML if available, else from citizen's type
+    # Severity: prefer ML prediction, fall back to a safe default
     ml = incident.get("ml") or {}
-    severity = ml.get("predictedSeverity") or "medium"
-    sev_marker = SEVERITY_ICONS.get(severity, "••")
+    severity = (ml.get("predictedSeverity") or "medium").upper()
 
-    # Short ID — first 6 chars of incident ID for SMS reply matching
-    short_id = (incident.get("id") or "")[:6].upper()
+    # Truncate description to keep the SMS compact
+    desc = (incident.get("description") or "").strip()
+    if len(desc) > 80:
+        desc = desc[:77] + "..."
 
-    # Vehicles detected (from text or image)
+    # Vehicles involved (from text or image analysis)
     vehicles_list = []
     if ml.get("mentionedVehicles"):
         vehicles_list = ml["mentionedVehicles"]
     elif ml.get("vehicles"):
         vehicles_list = list(ml["vehicles"].keys())
 
-    # Truncate description to keep SMS compact
-    desc = (incident.get("description") or "").strip()
-    if len(desc) > 60:
-        desc = desc[:57] + "…"
+    # Citizen contact — helps the responder call ahead if needed
+    citizen_name = (incident.get("citizenName") or "").strip()
+    citizen_phone = (incident.get("citizenPhone") or "").strip()
 
+    # ---- Compose the dispatch message ----
     lines = [
-        "🚨 ROADRESCUE ALERT",
+        f"ROADRESCUE DISPATCH  Ref {short_id}",
         "",
-        f"{icon} {label}  {sev_marker}",
-        f"📍 {barangay}",
+        f"Type      {label}",
+        f"Severity  {severity}",
+        f"Location  {barangay}",
     ]
 
     if vehicles_list:
-        # Cap at 3 vehicle types
-        v = ", ".join(vehicles_list[:3])
-        lines.append(f"🚗 {v}")
+        vehicles = ", ".join(vehicles_list[:3])
+        lines.append(f"Vehicles  {vehicles}")
 
     if desc:
-        lines.append(f"📝 \"{desc}\"")
+        lines.append(f'Report    "{desc}"')
+
+    if citizen_name or citizen_phone:
+        contact = citizen_name or "Citizen"
+        if citizen_phone:
+            contact = f"{contact}, {citizen_phone}"
+        lines.append(f"Contact   {contact}")
 
     lines.append("")
-    lines.append(f"ID: {short_id}")
-    lines.append("")
-    lines.append("Reply YES to acknowledge.")
+    lines.append(f"Reply YES {short_id} to acknowledge.")
 
-    return "\n".join(lines)
+    message = "\n".join(lines)
+
+    # Final safety pass — guarantee no unicode sneaks through
+    return _ascii_safe(message)
+
 
 def send_incident_sms(
     to_phone: str,
@@ -130,7 +154,9 @@ def send_incident_sms(
     # ---- Stub mode when no token ----
     if not token:
         print(f"[sms][stub] -> {to_phone}")
-        print(f"[sms][stub]    {message}")
+        print(f"[sms][stub]")
+        for line in message.split("\n"):
+            print(f"[sms][stub]    {line}")
         return {
             "ok": True,
             "provider": "stub",
@@ -151,6 +177,9 @@ def send_incident_sms(
         if phone.startswith("0"):
             phone = "63" + phone[1:]
 
+        # Final encoding safety check
+        safe_message = _ascii_safe(message)
+
         resp = requests.post(
             "https://rest.moceanapi.com/rest/2/sms",
             headers={
@@ -160,7 +189,7 @@ def send_incident_sms(
             data={
                 "mocean-from": sender,
                 "mocean-to": phone,
-                "mocean-text": message,
+                "mocean-text": safe_message,
                 "mocean-resp-format": "json",
             },
             timeout=15,
