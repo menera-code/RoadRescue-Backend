@@ -5,6 +5,7 @@ Responsibilities:
   - ML classification of incidents (Gemini + YOLO)
   - Analytics aggregations (cached, cheap on Firestore reads)
   - SMS notifications (MOCEAN)
+  - Two-way SMS webhook (responder acknowledgment + QRT)
 
 Run locally:
   uvicorn main:app --reload --port 8000
@@ -12,14 +13,13 @@ Run locally:
 
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
-from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -125,6 +125,7 @@ class ClassifyResponse(BaseModel):
     reported_type: Optional[str] = None
     reported_type_matches: Optional[bool] = None
 
+
 class DispatchRequest(BaseModel):
     incident_id: str = Field(..., description="Incident document ID to dispatch")
 
@@ -141,6 +142,7 @@ class DispatchResponse(BaseModel):
     sms_message_id: Optional[str] = None
     sms_error: Optional[str] = None
     message: str = ""
+
 
 # ---------------------------------------------------------------------------
 # Health
@@ -211,28 +213,66 @@ async def classify(req: ClassifyRequest) -> ClassifyResponse:
 
 
 # ---------------------------------------------------------------------------
-# Analytics
+# Analytics — cached aggregations
 # ---------------------------------------------------------------------------
 
 @app.get("/analytics/summary")
-async def analytics_summary() -> Dict[str, Any]:
+async def analytics_summary(days: int = 90) -> Dict[str, Any]:
     """
-    Top-line analytics for the admin dashboard.
+    Top-line counts: total, open, by-status, by-type, by-severity.
+    Cached for 60 seconds.
+    """
+    from analytics_service import get_summary
+    return get_summary(days=days)
 
-    Phase 3 (now)  → stub response.
-    Phase 5        → reads from Firestore with in-memory caching.
-    Phase 10       → daily rollups + ML insights.
+
+@app.get("/analytics/timeline")
+async def analytics_timeline(days: int = 30) -> Dict[str, Any]:
     """
-    return {
-        "total_incidents": 0,
-        "by_status": {},
-        "by_type": {},
-        "by_barangay": {},
-        "note": "Stub — will be wired to Firestore in Phase 5",
-    }
+    Daily incident counts for the last N days.
+    """
+    from analytics_service import get_timeline
+    return get_timeline(days=days)
+
+
+@app.get("/analytics/by-barangay")
+async def analytics_by_barangay(days: int = 90) -> Dict[str, Any]:
+    """
+    Incident counts grouped by barangay.
+    """
+    from analytics_service import get_by_barangay
+    return get_by_barangay(days=days)
+
+
+@app.get("/analytics/qrt")
+async def analytics_qrt(days: int = 90) -> Dict[str, Any]:
+    """
+    Quick Response Time stats: avg, median, p90, acknowledgment rate.
+    """
+    from analytics_service import get_qrt
+    return get_qrt(days=days)
+
+
+@app.get("/analytics/responders")
+async def analytics_responders(days: int = 90) -> Dict[str, Any]:
+    """
+    Per-responder activity + QRT leaderboard.
+    """
+    from analytics_service import get_responders
+    return get_responders(days=days)
+
+
+@app.get("/analytics/hourly")
+async def analytics_hourly(days: int = 30) -> Dict[str, Any]:
+    """
+    24-hour incident distribution (PH time).
+    """
+    from analytics_service import get_hourly_heatmap
+    return get_hourly_heatmap(days=days)
+
 
 # ---------------------------------------------------------------------------
-# Dispatch incident (admin → responder + SMS)
+# Dispatch incident (admin -> responder + SMS)
 # ---------------------------------------------------------------------------
 
 @app.post("/dispatch-incident", response_model=DispatchResponse)
@@ -245,14 +285,9 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
     Steps:
       1. Load the incident from Firestore
       2. Look up the assigned responder for its barangay
-      3. Send an SMS alert (stub in A6, real in A7)
-      4. Update the incident → status: 'pending' (visible to responders)
+      3. Send an SMS alert via MOCEAN
+      4. Update the incident -> status: 'pending' (visible to responders)
       5. Log the SMS result to notifications/
-
-    Auth note: for now this endpoint is unauthenticated on the backend.
-    The frontend only calls it after Firebase Auth login, and Firestore
-    rules still protect the writes. In production, add Firebase ID token
-    verification (30 lines) — deferred to a later phase.
     """
     from firebase_admin import firestore
     from sms_service import build_incident_sms, send_incident_sms
@@ -283,8 +318,8 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
     # ------------------------------------------------------------------
     # Look up the assigned responder for this barangay
     # ------------------------------------------------------------------
-    from_data = slugify_py(barangay_name)
-    b_snap = db.collection("barangays").document(from_data).get()
+    b_slug = slugify_py(barangay_name)
+    b_snap = db.collection("barangays").document(b_slug).get()
 
     if not b_snap.exists:
         return DispatchResponse(
@@ -308,7 +343,7 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
         )
 
     # ------------------------------------------------------------------
-    # Send SMS (stub or real depending on SMS_PROVIDER env)
+    # Send SMS (stub or real depending on MOCEAN_API_TOKEN env)
     # ------------------------------------------------------------------
     sms_body = build_incident_sms(incident, barangay_name)
     sms_result = send_incident_sms(
@@ -353,6 +388,13 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
     except Exception as e:
         print(f"[dispatch] notification log failed: {e}")
 
+    # Invalidate analytics cache so the dashboard reflects the dispatch
+    try:
+        from analytics_service import clear_cache
+        clear_cache()
+    except Exception:
+        pass
+
     return DispatchResponse(
         ok=True,
         incident_id=req.incident_id,
@@ -370,6 +412,90 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
             else "Dispatched, but SMS failed."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# SMS webhook — receives inbound replies from MOCEAN
+# ---------------------------------------------------------------------------
+
+@app.post("/sms/webhook")
+async def sms_webhook(request: Request) -> Dict[str, Any]:
+    """
+    MOCEAN posts inbound SMS replies here.
+
+    Called when a responder replies "YES" to an incident SMS.
+    Records acknowledgedAt + responseTimeSeconds on the matching incident.
+
+    Configure in MOCEAN:
+      API Account -> Global Settings -> MO URL
+      = https://<your-backend>.onrender.com/sms/webhook
+    """
+    from sms_webhook import parse_incoming, match_and_acknowledge
+
+    # ---------------------------------------------------------------------
+    # Parse whatever MOCEAN sends
+    # ---------------------------------------------------------------------
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    json_data = None
+    form_data = {}
+
+    if "application/json" in content_type:
+        try:
+            json_data = await request.json()
+        except Exception:
+            json_data = None
+    elif "form" in content_type:
+        try:
+            form = await request.form()
+            form_data = dict(form)
+        except Exception:
+            form_data = {}
+    else:
+        # Fallback: try both
+        try:
+            form = await request.form()
+            form_data = dict(form)
+        except Exception:
+            pass
+        try:
+            json_data = await request.json()
+        except Exception:
+            pass
+
+    parsed = parse_incoming(form_data, json_data)
+    from_phone = parsed["from"]
+    text = parsed["text"]
+
+    # Log for debugging
+    print(f"[webhook] inbound from={from_phone!r} text={text[:100]!r}")
+
+    if not from_phone or not text:
+        return {
+            "ok": False,
+            "error": "Missing sender or message body.",
+        }
+
+    # ---------------------------------------------------------------------
+    # Match to incident + acknowledge
+    # ---------------------------------------------------------------------
+    try:
+        result = match_and_acknowledge(from_phone, text)
+    except Exception as e:
+        print(f"[webhook] ❌ match_and_acknowledge crashed: {e}")
+        return {
+            "ok": False,
+            "error": str(e)[:200],
+        }
+
+    # Invalidate analytics cache so QRT metrics refresh
+    try:
+        from analytics_service import clear_cache
+        clear_cache()
+    except Exception:
+        pass
+
+    return {"ok": True, **result}
 
 
 # ---------------------------------------------------------------------------
