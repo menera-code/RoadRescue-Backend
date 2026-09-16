@@ -60,46 +60,36 @@ def _ascii_safe(text: str) -> str:
 
 def build_incident_sms(incident: dict, barangay: str) -> str:
     """
-    Format a formal dispatch SMS for the responder.
+    Format a formal dispatch SMS with a deep link for acknowledgment.
 
-    Design constraints:
-      - PLAIN ASCII ONLY. Emojis and unicode symbols render as "?" on
-        many PH carriers (UCS-2 encoding issue). All content must survive
-        GSM-7 encoding.
-      - Structured like an emergency dispatch notice — labels aligned,
-        sections separated by blank lines.
-      - Includes a reference code so the responder can reply "YES <ref>"
-        to acknowledge the correct incident when multiple are active.
-      - Includes citizen contact so the responder can reach them directly.
-
-    Target length: under 320 chars (~2 SMS segments).
+    The ack URL opens the responder's app (PWA) directly on the incident.
+    We use the base URL from FRONTEND_URL env var so dev/prod both work.
     """
     short_id = (incident.get("id") or "")[:6].upper()
-
     incident_type = incident.get("type", "other")
     label = TYPE_LABELS.get(incident_type, "Incident")
 
-    # Severity: prefer ML prediction, fall back to a safe default
     ml = incident.get("ml") or {}
     severity = (ml.get("predictedSeverity") or "medium").upper()
 
-    # Truncate description to keep the SMS compact
     desc = (incident.get("description") or "").strip()
-    if len(desc) > 80:
-        desc = desc[:77] + "..."
+    if len(desc) > 60:
+        desc = desc[:57] + "..."
 
-    # Vehicles involved (from text or image analysis)
     vehicles_list = []
     if ml.get("mentionedVehicles"):
         vehicles_list = ml["mentionedVehicles"]
     elif ml.get("vehicles"):
         vehicles_list = list(ml["vehicles"].keys())
 
-    # Citizen contact — helps the responder call ahead if needed
     citizen_name = (incident.get("citizenName") or "").strip()
     citizen_phone = (incident.get("citizenPhone") or "").strip()
 
-    # ---- Compose the dispatch message ----
+    # Base URL from env — localhost in dev, deployed URL in production
+    base_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+    ack_url = f"{base_url}/dashboard?ack={short_id}"
+
+    # ---- Compose the SMS ----
     lines = [
         f"ROADRESCUE DISPATCH  Ref {short_id}",
         "",
@@ -109,8 +99,7 @@ def build_incident_sms(incident: dict, barangay: str) -> str:
     ]
 
     if vehicles_list:
-        vehicles = ", ".join(vehicles_list[:3])
-        lines.append(f"Vehicles  {vehicles}")
+        lines.append(f"Vehicles  {', '.join(vehicles_list[:3])}")
 
     if desc:
         lines.append(f'Report    "{desc}"')
@@ -122,13 +111,9 @@ def build_incident_sms(incident: dict, barangay: str) -> str:
         lines.append(f"Contact   {contact}")
 
     lines.append("")
-    lines.append(f"Reply YES {short_id} to acknowledge.")
+    lines.append(f"Ack: {ack_url}")
 
-    message = "\n".join(lines)
-
-    # Final safety pass — guarantee no unicode sneaks through
-    return _ascii_safe(message)
-
+    return _ascii_safe("\n".join(lines))
 
 def send_incident_sms(
     to_phone: str,
