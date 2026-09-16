@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Env + secrets
+.env
+service-account.json
+*.serviceAccount.json
+roadrescue-*-firebase-adminsdk-*.json
+*-firebase-adminsdk-*.json
+
+# Logs
+*.log
+
+# YOLO model weights (downloaded on first run — 6 MB, don't commit)
+*.pt
+
+# OS junk
+.DS_Store
+Thumbs.db
