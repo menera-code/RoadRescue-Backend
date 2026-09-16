@@ -284,3 +284,106 @@ def get_hourly_heatmap(days: int = 30) -> Dict[str, Any]:
         "hours": [{"hour": h, "count": hour_counts[h]} for h in range(24)],
         "window_days": days,
     }
+
+# ---------------------------------------------------------------------------
+# Endpoint 7 — History (raw incident list with filters)
+# ---------------------------------------------------------------------------
+
+def get_history(
+    days: int = 90,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    status: Optional[str] = None,
+    incident_type: Optional[str] = None,
+    barangay: Optional[str] = None,
+    limit: int = 500,
+) -> Dict[str, Any]:
+    """
+    Return a filtered, sorted list of incidents for the admin history view.
+
+    Filters:
+      - from_date / to_date: ISO date strings (YYYY-MM-DD), inclusive
+      - status: exact match (e.g. 'pending', 'resolved')
+      - incident_type: exact match (e.g. 'minor_collision')
+      - barangay: substring match (case-insensitive)
+
+    Returns the incidents sorted newest-first, capped at `limit`.
+    """
+    incidents = _fetch_incidents(days)
+
+    # ---- Date range filter ----
+    from_dt = None
+    to_dt = None
+    if from_date:
+        try:
+            from_dt = datetime.strptime(from_date, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            pass
+    if to_date:
+        try:
+            # Inclusive end-of-day
+            to_dt = datetime.strptime(to_date, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, tzinfo=timezone.utc
+            )
+        except ValueError:
+            pass
+
+    filtered = []
+    for inc in incidents:
+        created = _to_dt(inc.get("createdAt"))
+        if not created:
+            continue
+
+        if from_dt and created < from_dt:
+            continue
+        if to_dt and created > to_dt:
+            continue
+
+        if status and inc.get("status") != status:
+            continue
+
+        inc_type = _type_of(inc)
+        if incident_type and inc_type != incident_type:
+            continue
+
+        if barangay:
+            b = (inc.get("barangay") or "").lower()
+            if barangay.lower() not in b:
+                continue
+
+        filtered.append({
+            "id": inc.get("id"),
+            "createdAt": created.isoformat(),
+            "type": inc_type,
+            "reportedType": inc.get("type"),
+            "severity": _severity_of(inc),
+            "status": inc.get("status", "unknown"),
+            "barangay": inc.get("barangay") or "",
+            "citizenName": inc.get("citizenName") or "",
+            "citizenPhone": inc.get("citizenPhone") or "",
+            "description": inc.get("description") or "",
+            "responderName": inc.get("assignedResponderName") or inc.get("responderName") or "",
+            "acknowledgedAt": (
+                _to_dt(inc.get("acknowledgedAt")).isoformat()
+                if _to_dt(inc.get("acknowledgedAt"))
+                else None
+            ),
+            "responseTimeSeconds": inc.get("responseTimeSeconds"),
+            "photoCount": len(inc.get("photoUrls") or []),
+            "hasVideo": bool(inc.get("videoUrl")),
+        })
+
+    # Sort newest first
+    filtered.sort(key=lambda x: x["createdAt"], reverse=True)
+
+    total = len(filtered)
+    filtered = filtered[:limit]
+
+    return {
+        "incidents": filtered,
+        "total": total,
+        "returned": len(filtered),
+        "limit": limit,
+    }

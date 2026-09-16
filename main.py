@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -270,6 +270,38 @@ async def analytics_hourly(days: int = 30) -> Dict[str, Any]:
     from analytics_service import get_hourly_heatmap
     return get_hourly_heatmap(days=days)
 
+@app.get("/analytics/history")
+async def analytics_history(
+    from_date: Optional[str] = Query(None, alias="from"),
+    to_date: Optional[str] = Query(None, alias="to"),
+    status: Optional[str] = None,
+    type: Optional[str] = None,
+    barangay: Optional[str] = None,
+    days: int = 90,
+    limit: int = 500,
+) -> Dict[str, Any]:
+    """
+    Filtered list of incidents for the admin History tab.
+
+    Query params:
+      from      - ISO date (YYYY-MM-DD), inclusive
+      to        - ISO date (YYYY-MM-DD), inclusive
+      status    - 'pending' | 'resolved' | ...
+      type      - 'minor_collision' | 'road_hazard' | ...
+      barangay  - substring match
+      days      - pre-filter window (default 90)
+      limit     - max incidents returned (default 500)
+    """
+    from analytics_service import get_history
+    return get_history(
+        days=days,
+        from_date=from_date,
+        to_date=to_date,
+        status=status,
+        incident_type=type,
+        barangay=barangay,
+        limit=limit,
+    )
 
 # ---------------------------------------------------------------------------
 # Dispatch incident (admin -> responder + SMS)
