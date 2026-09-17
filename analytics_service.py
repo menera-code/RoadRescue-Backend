@@ -387,3 +387,432 @@ def get_history(
         "returned": len(filtered),
         "limit": limit,
     }
+
+# ===========================================================================
+# ML CAPSTONE ANALYTICS
+# ===========================================================================
+
+from datetime import timedelta as _timedelta
+_PH_TZ = timezone(_timedelta(hours=8))  # UTC+8
+
+
+def _ph_parts(ts: Any) -> Optional[Dict[str, int]]:
+    """Convert a timestamp to PH (UTC+8) hour/day/date components."""
+    dt = _to_dt(ts)
+    if not dt:
+        return None
+    ph = dt.astimezone(_PH_TZ)
+    return {
+        "hour": ph.hour,
+        "dow": ph.weekday(),          # 0 = Monday
+        "date": ph.strftime("%Y-%m-%d"),
+        "month": ph.strftime("%Y-%m"),
+        "week": ph.strftime("%Y-W%V"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ML 1 — Barangay × temporal heatmap
+# ---------------------------------------------------------------------------
+
+def get_barangay_temporal(days: int = 90) -> Dict[str, Any]:
+    """
+    Barangay × hour-of-day + day-of-week matrix for heatmap visualization.
+    Includes each barangay's peak hour, top incident type, and daily counts.
+    """
+    from collections import Counter, defaultdict
+
+    incidents = _fetch_incidents(days)
+
+    barangay_hour = defaultdict(lambda: [0] * 24)
+    barangay_dow = defaultdict(lambda: [0] * 7)
+    barangay_totals = Counter()
+    barangay_types = defaultdict(Counter)
+
+    for inc in incidents:
+        parts = _ph_parts(inc.get("createdAt"))
+        if not parts:
+            continue
+        b = inc.get("barangay") or "Unspecified"
+        barangay_hour[b][parts["hour"]] += 1
+        barangay_dow[b][parts["dow"]] += 1
+        barangay_totals[b] += 1
+        barangay_types[b][_type_of(inc)] += 1
+
+    result = []
+    for barangay, total in barangay_totals.most_common():
+        hours = barangay_hour[barangay]
+        peak_hour = hours.index(max(hours)) if any(hours) else None
+        dows = barangay_dow[barangay]
+        peak_dow = dows.index(max(dows)) if any(dows) else None
+        top_type, top_count = (
+            barangay_types[barangay].most_common(1)[0]
+            if barangay_types[barangay]
+            else ("other", 0)
+        )
+        result.append({
+            "barangay": barangay,
+            "total": total,
+            "hourly": hours,
+            "daily": dows,
+            "peak_hour": peak_hour,
+            "peak_dow": peak_dow,
+            "top_type": top_type,
+            "top_type_count": top_count,
+            "top_type_share": round(top_count / total, 3) if total else 0,
+        })
+
+    return {
+        "barangays": result,
+        "window_days": days,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ML 2 — Vehicle detection analytics
+# ---------------------------------------------------------------------------
+
+def get_vehicle_analytics(days: int = 90) -> Dict[str, Any]:
+    """
+    Vehicle detection analytics combining YOLO image detections + Gemini text.
+    """
+    from collections import Counter, defaultdict
+
+    incidents = _fetch_incidents(days)
+
+    vehicle_mentions = Counter()
+    vehicle_detections = Counter()
+    vehicle_all = Counter()
+    vehicle_by_type = defaultdict(Counter)
+    vehicle_by_severity = defaultdict(Counter)
+
+    detections_total = 0
+    incidents_with_yolo = 0
+    incidents_with_text_vehicles = 0
+    detection_confidence_sum = 0.0
+    detection_confidence_count = 0
+
+    for inc in incidents:
+        ml = inc.get("ml") or {}
+        inc_type = _type_of(inc)
+        severity = _severity_of(inc)
+
+        text_vehicles = ml.get("mentionedVehicles") or []
+        if text_vehicles:
+            incidents_with_text_vehicles += 1
+            for v in text_vehicles:
+                v_lower = str(v).lower()
+                vehicle_mentions[v_lower] += 1
+                vehicle_all[v_lower] += 1
+                vehicle_by_type[inc_type][v_lower] += 1
+                vehicle_by_severity[severity][v_lower] += 1
+
+        yolo_vehicles = ml.get("vehicles") or {}
+        if yolo_vehicles:
+            incidents_with_yolo += 1
+            for v, count in yolo_vehicles.items():
+                v_lower = str(v).lower()
+                vehicle_detections[v_lower] += count
+                vehicle_all[v_lower] += count
+                vehicle_by_type[inc_type][v_lower] += count
+                vehicle_by_severity[severity][v_lower] += count
+
+        for d in (ml.get("detections") or []):
+            conf = d.get("confidence")
+            if isinstance(conf, (int, float)):
+                detection_confidence_sum += conf
+                detection_confidence_count += 1
+            detections_total += 1
+
+    total_incidents = len(incidents) or 1
+
+    top_vehicles = [
+        {
+            "vehicle": v,
+            "count": c,
+            "from_text": vehicle_mentions.get(v, 0),
+            "from_yolo": vehicle_detections.get(v, 0),
+        }
+        for v, c in vehicle_all.most_common(15)
+    ]
+
+    return {
+        "total_incidents": len(incidents),
+        "incidents_with_yolo": incidents_with_yolo,
+        "incidents_with_text_vehicles": incidents_with_text_vehicles,
+        "yolo_coverage_rate": round(incidents_with_yolo / total_incidents, 3),
+        "total_detections": detections_total,
+        "avg_yolo_confidence": round(
+            detection_confidence_sum / detection_confidence_count, 3
+        ) if detection_confidence_count else 0,
+        "top_vehicles": top_vehicles,
+        "by_incident_type": {t: dict(c) for t, c in vehicle_by_type.items()},
+        "by_severity": {s: dict(c) for s, c in vehicle_by_severity.items()},
+        "window_days": days,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ML 3 — ML performance (accuracy + calibration)
+# ---------------------------------------------------------------------------
+
+def get_ml_performance(days: int = 90) -> Dict[str, Any]:
+    """
+    ML accuracy, confusion matrix, and confidence calibration.
+    """
+    from collections import Counter, defaultdict
+
+    incidents = _fetch_incidents(days)
+    with_ml = [i for i in incidents if i.get("ml")]
+
+    if not with_ml:
+        return {
+            "total_analyzed": 0,
+            "evaluated": 0,
+            "overall": {"match_rate": 0, "matches": 0, "mismatches": 0},
+            "per_type": [],
+            "confusion_matrix": [],
+            "confidence_calibration": [],
+            "language_performance": [],
+            "sources_used": {},
+            "timings": {"avg_total_ms": 0, "avg_gemini_ms": 0, "sample_count": 0},
+            "window_days": days,
+        }
+
+    matches = 0
+    mismatches = 0
+    per_type = defaultdict(lambda: {"total": 0, "matched": 0})
+    confusion = Counter()
+    confidence_buckets = {
+        "0.9-1.0": {"total": 0, "matched": 0},
+        "0.75-0.9": {"total": 0, "matched": 0},
+        "0.5-0.75": {"total": 0, "matched": 0},
+        "<0.5": {"total": 0, "matched": 0},
+    }
+    lang_perf = defaultdict(lambda: {"total": 0, "matched": 0})
+    sources = Counter()
+    timings = []
+    gemini_timings = []
+
+    for inc in with_ml:
+        ml = inc["ml"]
+        reported = ml.get("reportedType") or inc.get("type") or "other"
+        predicted = ml.get("predictedType") or "other"
+        is_match = ml.get("reportedTypeMatches")
+
+        per_type[reported]["total"] += 1
+        if is_match:
+            matches += 1
+            per_type[reported]["matched"] += 1
+        elif is_match is False:
+            mismatches += 1
+            confusion[f"{reported} → {predicted}"] += 1
+
+        conf = ml.get("confidence") or 0
+        if conf >= 0.9:
+            bucket = "0.9-1.0"
+        elif conf >= 0.75:
+            bucket = "0.75-0.9"
+        elif conf >= 0.5:
+            bucket = "0.5-0.75"
+        else:
+            bucket = "<0.5"
+        confidence_buckets[bucket]["total"] += 1
+        if is_match:
+            confidence_buckets[bucket]["matched"] += 1
+
+        capstone = ml.get("capstone") or {}
+        lang = capstone.get("language", "unknown")
+        lang_perf[lang]["total"] += 1
+        if is_match:
+            lang_perf[lang]["matched"] += 1
+
+        for s in (ml.get("sources") or []):
+            sources[s] += 1
+
+        t_total = capstone.get("total_processing_ms", 0)
+        if t_total > 0:
+            timings.append(t_total)
+        t_gemini = (capstone.get("timings_ms") or {}).get("gemini_ms", 0)
+        if t_gemini > 0:
+            gemini_timings.append(t_gemini)
+
+    evaluated = matches + mismatches
+
+    return {
+        "total_analyzed": len(with_ml),
+        "evaluated": evaluated,
+        "overall": {
+            "match_rate": round(matches / evaluated, 3) if evaluated else 0,
+            "matches": matches,
+            "mismatches": mismatches,
+        },
+        "per_type": [
+            {
+                "type": t,
+                "total": data["total"],
+                "matched": data["matched"],
+                "accuracy": round(data["matched"] / data["total"], 3)
+                    if data["total"] else 0,
+            }
+            for t, data in sorted(per_type.items(), key=lambda x: -x[1]["total"])
+        ],
+        "confusion_matrix": [
+            {"pattern": k, "count": v} for k, v in confusion.most_common(10)
+        ],
+        "confidence_calibration": [
+            {
+                "bucket": bucket,
+                "total": data["total"],
+                "matched": data["matched"],
+                "accuracy": round(data["matched"] / data["total"], 3)
+                    if data["total"] else 0,
+            }
+            for bucket, data in confidence_buckets.items()
+        ],
+        "language_performance": [
+            {
+                "language": lang,
+                "total": data["total"],
+                "matched": data["matched"],
+                "accuracy": round(data["matched"] / data["total"], 3)
+                    if data["total"] else 0,
+            }
+            for lang, data in lang_perf.items()
+        ],
+        "sources_used": dict(sources),
+        "timings": {
+            "avg_total_ms": round(sum(timings) / len(timings), 1) if timings else 0,
+            "avg_gemini_ms": round(sum(gemini_timings) / len(gemini_timings), 1)
+                if gemini_timings else 0,
+            "sample_count": len(timings),
+        },
+        "window_days": days,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ML 4 — Pattern discovery (statistical trends)
+# ---------------------------------------------------------------------------
+
+def get_patterns(days: int = 180) -> Dict[str, Any]:
+    """
+    Statistical pattern analysis: day-of-week, hour-of-day, monthly, weekly.
+    """
+    from collections import Counter, defaultdict
+
+    incidents = _fetch_incidents(days)
+
+    dow_counts = [0] * 7
+    hour_counts = [0] * 24
+    monthly = Counter()
+    weekly = Counter()
+    dow_type = defaultdict(Counter)
+
+    for inc in incidents:
+        parts = _ph_parts(inc.get("createdAt"))
+        if not parts:
+            continue
+        dow_counts[parts["dow"]] += 1
+        hour_counts[parts["hour"]] += 1
+        monthly[parts["month"]] += 1
+        weekly[parts["week"]] += 1
+        dow_type[parts["dow"]][_type_of(inc)] += 1
+
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    return {
+        "day_of_week": [
+            {"day": day_names[i], "count": dow_counts[i]} for i in range(7)
+        ],
+        "hour_of_day": [
+            {"hour": h, "count": hour_counts[h]} for h in range(24)
+        ],
+        "monthly": [
+            {"month": m, "count": c} for m, c in sorted(monthly.items())
+        ],
+        "weekly": [
+            {"week": w, "count": c} for w, c in sorted(weekly.items())
+        ],
+        "top_types_by_day": [
+            {
+                "day": day_names[d],
+                "types": [
+                    {"type": t, "count": c}
+                    for t, c in dow_type[d].most_common(3)
+                ],
+            }
+            for d in range(7)
+        ],
+        "window_days": days,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ML 5 — Predictive insights
+# ---------------------------------------------------------------------------
+
+def get_predictions(days: int = 90) -> Dict[str, Any]:
+    """
+    Simple moving-average forecasting for next week + barangay trends.
+    """
+    from collections import Counter, defaultdict
+
+    incidents = _fetch_incidents(days)
+
+    by_week = Counter()
+    by_barangay_week = defaultdict(Counter)
+    hourly = Counter()
+
+    for inc in incidents:
+        parts = _ph_parts(inc.get("createdAt"))
+        if not parts:
+            continue
+        by_week[parts["week"]] += 1
+        hourly[parts["hour"]] += 1
+        b = inc.get("barangay") or "Unspecified"
+        by_barangay_week[b][parts["week"]] += 1
+
+    sorted_weeks = sorted(by_week.keys())
+    weekly_counts = [by_week[w] for w in sorted_weeks]
+
+    last_3 = weekly_counts[-3:] if len(weekly_counts) >= 3 else weekly_counts
+    next_week_pred = round(sum(last_3) / len(last_3)) if last_3 else 0
+
+    wow_growth = 0.0
+    if len(weekly_counts) >= 2:
+        last_week = weekly_counts[-1]
+        prev_week = weekly_counts[-2]
+        if prev_week:
+            wow_growth = round((last_week - prev_week) / prev_week * 100, 1)
+
+    barangay_forecasts = []
+    for b, weeks in by_barangay_week.items():
+        recent = [weeks.get(w, 0) for w in sorted_weeks[-4:]]
+        avg = sum(recent) / len(recent) if recent else 0
+        if len(recent) >= 2:
+            if recent[-1] > recent[-2]:
+                trend = "up"
+            elif recent[-1] < recent[-2]:
+                trend = "down"
+            else:
+                trend = "stable"
+        else:
+            trend = "stable"
+        barangay_forecasts.append({
+            "barangay": b,
+            "predicted_incidents": round(avg, 1),
+            "trend": trend,
+        })
+
+    barangay_forecasts.sort(key=lambda x: -x["predicted_incidents"])
+
+    return {
+        "predicted_next_week_total": next_week_pred,
+        "wow_growth_percent": wow_growth,
+        "predicted_peak_hours": [h for h, _ in hourly.most_common(3)],
+        "barangay_forecasts": barangay_forecasts[:10],
+        "data_points_used": len(weekly_counts),
+        "window_days": days,
+    }

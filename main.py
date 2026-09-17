@@ -303,6 +303,40 @@ async def analytics_history(
         limit=limit,
     )
 
+
+@app.get("/analytics/barangay-temporal")
+async def analytics_barangay_temporal(days: int = 90) -> Dict[str, Any]:
+    """Barangay × hour-of-day matrix for ML heatmap."""
+    from analytics_service import get_barangay_temporal
+    return get_barangay_temporal(days=days)
+
+
+@app.get("/analytics/vehicles")
+async def analytics_vehicles(days: int = 90) -> Dict[str, Any]:
+    """Vehicle detection analytics (YOLO + text)."""
+    from analytics_service import get_vehicle_analytics
+    return get_vehicle_analytics(days=days)
+
+
+@app.get("/analytics/ml-performance")
+async def analytics_ml_performance(days: int = 90) -> Dict[str, Any]:
+    """ML accuracy, confusion matrix, calibration."""
+    from analytics_service import get_ml_performance
+    return get_ml_performance(days=days)
+
+
+@app.get("/analytics/patterns")
+async def analytics_patterns(days: int = 180) -> Dict[str, Any]:
+    """Statistical patterns: day-of-week, hour, monthly."""
+    from analytics_service import get_patterns
+    return get_patterns(days=days)
+
+
+@app.get("/analytics/predictions")
+async def analytics_predictions(days: int = 90) -> Dict[str, Any]:
+    """Predictive forecasts: next-week, trends."""
+    from analytics_service import get_predictions
+    return get_predictions(days=days)
 # ---------------------------------------------------------------------------
 # Dispatch incident (admin -> responder + SMS)
 # ---------------------------------------------------------------------------
