@@ -563,6 +563,175 @@ async def sms_webhook(request: Request) -> Dict[str, Any]:
 
     return {"ok": True, **result}
 
+# ===========================================================================
+# ADMIN — User management
+# ===========================================================================
+
+import secrets
+import string as _string
+
+
+def _random_password(length: int = 10) -> str:
+    """Readable 10-char password — no ambiguous chars."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _random_email_slug(length: int = 8) -> str:
+    alphabet = _string.ascii_lowercase + _string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+class InviteResponderRequest(BaseModel):
+    fullName: str = Field(..., min_length=2)
+    phone: str = Field(..., min_length=10)
+    barangay: str = Field(..., min_length=2)
+    agency: Optional[str] = None
+
+
+class InviteResponderResponse(BaseModel):
+    ok: bool
+    uid: Optional[str] = None
+    tempEmail: Optional[str] = None
+    tempPassword: Optional[str] = None
+    sms_ok: bool = False
+    sms_error: Optional[str] = None
+    message: str = ""
+
+
+@app.post("/admin/invite-responder", response_model=InviteResponderResponse)
+async def admin_invite_responder(req: InviteResponderRequest) -> InviteResponderResponse:
+    """
+    Admin-only. Creates a Firebase Auth user + Firestore profile for a
+    new responder using a temporary email + password, sends an SMS with
+    the credentials, and forces a credential reset on first login.
+    """
+    from firebase_admin import auth as fb_auth, firestore
+    from sms_service import send_incident_sms
+
+    db = firestore.client()
+
+    # 1) Generate credentials
+    temp_email = f"responder-{_random_email_slug()}@invite.roadrescue.app"
+    temp_password = _random_password()
+
+    # 2) Create Auth user
+    try:
+        user = fb_auth.create_user(
+            email=temp_email,
+            password=temp_password,
+            display_name=req.fullName,
+        )
+    except Exception as e:
+        return InviteResponderResponse(
+            ok=False,
+            message=f"Failed to create user: {str(e)[:120]}",
+        )
+
+    # 3) Write Firestore doc
+    now = datetime.now(timezone.utc)
+    db.collection("users").document(user.uid).set({
+        "uid": user.uid,
+        "fullName": req.fullName,
+        "email": temp_email,
+        "phone": req.phone,
+        "role": "responder",
+        "status": "active",
+        "agency": req.agency or "",
+        "badgeId": "",
+        "barangay": req.barangay,
+        "assignedBarangay": req.barangay,
+        "disabled": False,
+        "lastSeen": None,
+        "mustChangeCredentials": True,
+        "invitedBy": "admin",
+        "invitedAt": now,
+        "termsAccepted": True,
+        "termsVersion": "1.0.0",
+        "termsAcceptedAt": now,
+        "createdAt": now,
+        "updatedAt": now,
+    })
+
+    # Mirror on barangay doc
+    try:
+        import re
+        slug = re.sub(r"[()]", "", req.barangay.lower())
+        slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+        db.collection("barangays").document(slug).update({
+            "responderUid": user.uid,
+            "responderName": req.fullName,
+            "responderPhone": req.phone,
+            "assignedAt": now,
+            "updatedAt": now,
+        })
+    except Exception as e:
+        print(f"[invite] barangay mirror failed: {e}")
+
+    # 4) Send SMS with credentials
+    sms_body = (
+        "ROADRESCUE RESPONDER INVITATION\n"
+        "\n"
+        "You have been invited as a responder.\n"
+        "\n"
+        "Login credentials:\n"
+        f"Email:    {temp_email}\n"
+        f"Password: {temp_password}\n"
+        "\n"
+        "Open the app and sign in. You will be\n"
+        "asked to set your real email and password\n"
+        "on first login.\n"
+        "\n"
+        "--\n"
+        "RoadRescue Response System"
+    )
+    sms_result = send_incident_sms(
+        to_phone=req.phone,
+        message=sms_body,
+        incident_id=f"invite-{user.uid[:6]}",
+    )
+
+    return InviteResponderResponse(
+        ok=True,
+        uid=user.uid,
+        tempEmail=temp_email,
+        tempPassword=temp_password,
+        sms_ok=sms_result["ok"],
+        sms_error=sms_result.get("error"),
+        message=(
+            "Responder invited and SMS sent."
+            if sms_result["ok"]
+            else "Responder created, but SMS failed."
+        ),
+    )
+
+
+class ToggleUserStatusRequest(BaseModel):
+    uid: str
+    disabled: bool
+
+
+@app.post("/admin/toggle-user-status")
+async def admin_toggle_user_status(req: ToggleUserStatusRequest) -> Dict[str, Any]:
+    """Enable or disable a user account."""
+    from firebase_admin import auth as fb_auth, firestore
+
+    db = firestore.client()
+
+    try:
+        fb_auth.update_user(req.uid, disabled=req.disabled)
+    except Exception as e:
+        return {"ok": False, "error": f"Auth update failed: {str(e)[:120]}"}
+
+    try:
+        db.collection("users").document(req.uid).update({
+            "disabled": req.disabled,
+            "updatedAt": datetime.now(timezone.utc),
+        })
+    except Exception as e:
+        return {"ok": False, "error": f"Firestore update failed: {str(e)[:120]}"}
+
+    return {"ok": True, "uid": req.uid, "disabled": req.disabled}
 
 # ---------------------------------------------------------------------------
 # Helpers
