@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +205,7 @@ def health() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Classify (ML)
+# Classify
 # ---------------------------------------------------------------------------
 
 @app.post("/classify", response_model=ClassifyResponse)
@@ -326,7 +326,7 @@ async def analytics_predictions(days: int = 90) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Dispatch incident (admin → responder + SMS)
+# Dispatch incident
 # ---------------------------------------------------------------------------
 
 @app.post("/dispatch-incident", response_model=DispatchResponse)
@@ -444,7 +444,6 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
 # ---------------------------------------------------------------------------
 
 def _nearest_barangay(lat: float, lng: float) -> Optional[Dict[str, Any]]:
-    """Closest barangay from the static list, using haversine distance."""
     try:
         from data.barangays import to_documents
     except Exception as e:
@@ -486,18 +485,17 @@ async def emergency(req: EmergencyRequest) -> EmergencyResponse:
     """
     Anonymous 1-tap emergency.
 
-    Creates an incident with status 'emergency_pending' and priority
-    'critical'. Does NOT dispatch — the admin reviews it first.
-
-    The nearest barangay is stored as `suggestedBarangay` so the admin
-    sees the auto-detected value but can override it.
+    Creates an incident with status 'unverified' so it shows up in the
+    admin Verify tab alongside regular reports. Also tagged with
+    type='emergency' and priority='critical' so the Emergencies tab
+    (which filters by type) shows it too.
     """
     from firebase_admin import firestore
 
     db = firestore.client()
     now = datetime.now(timezone.utc)
 
-    # ---- Rate limit ----
+    # Rate limit
     if req.device_id:
         five_min_ago = now - timedelta(minutes=5)
         try:
@@ -523,7 +521,7 @@ async def emergency(req: EmergencyRequest) -> EmergencyResponse:
         except Exception as e:
             print(f"[emergency] rate-limit check skipped: {e}")
 
-    # ---- Locate barangay ----
+    # Locate barangay
     b = _nearest_barangay(req.lat, req.lng)
     if not b:
         return EmergencyResponse(
@@ -533,7 +531,7 @@ async def emergency(req: EmergencyRequest) -> EmergencyResponse:
 
     barangay_name = b.get("name") or "Unknown"
 
-    # ---- Create incident ----
+    # Create incident
     incident_ref = db.collection("incidents").document()
     incident_id = incident_ref.id
     short_id = incident_id[:6].upper()
@@ -555,8 +553,11 @@ async def emergency(req: EmergencyRequest) -> EmergencyResponse:
         "citizenUid": None,
         "anonymous": True,
         "deviceId": req.device_id,
-        "status": "emergency_pending",
+
+        # Unverified so it shows in the admin Verify tab
+        "status": "unverified",
         "priority": "critical",
+
         "createdAt": now,
         "updatedAt": now,
         "photoUrls": [],
@@ -798,7 +799,7 @@ async def acknowledge(req: AcknowledgeRequest) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# SMS webhook (legacy "YES" reply path)
+# SMS webhook
 # ---------------------------------------------------------------------------
 
 @app.post("/sms/webhook")
@@ -806,7 +807,6 @@ async def sms_webhook(request: Request) -> Dict[str, Any]:
     from sms_webhook import parse_incoming, match_and_acknowledge
 
     content_type = (request.headers.get("content-type") or "").lower()
-
     json_data = None
     form_data = {}
 
