@@ -1,20 +1,12 @@
 """
 RoadRescue API — FastAPI backend.
-
-Responsibilities:
-  - ML classification of incidents (Gemini + YOLO)
-  - Analytics aggregations (cached, cheap on Firestore reads)
-  - SMS notifications (MOCEAN)
-  - Acknowledgement tracking (SMS link + responder app)
-
-Run locally:
-  uvicorn main:app --reload --port 8000
 """
 
+import math
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -25,7 +17,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +25,6 @@ VERSION = "0.2.0"
 # ---------------------------------------------------------------------------
 
 def slugify_py(name: str) -> str:
-    """Match the frontend's slugify() exactly."""
     s = name.lower()
     s = re.sub(r"[()]", "", s)
     s = re.sub(r"[^a-z0-9]+", "-", s)
@@ -41,7 +32,6 @@ def slugify_py(name: str) -> str:
 
 
 def _to_dt(ts: Any) -> Optional[datetime]:
-    """Coerce a Firestore Timestamp / datetime / None into an aware datetime."""
     if not ts:
         return None
     if isinstance(ts, datetime):
@@ -52,7 +42,7 @@ def _to_dt(ts: Any) -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — starts / stops the Firestore worker
+# Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
@@ -80,10 +70,6 @@ async def lifespan(app: FastAPI):
         pass
 
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
-
 app = FastAPI(
     title="RoadRescue API",
     description="ML classification + analytics backend for RoadRescue",
@@ -109,13 +95,13 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Request / response models
+# Models
 # ---------------------------------------------------------------------------
 
 class ClassifyRequest(BaseModel):
-    text: str = Field(..., description="Free-text description of the incident")
-    image_urls: Optional[List[str]] = Field(default=None)
-    reported_type: Optional[str] = Field(default=None)
+    text: str
+    image_urls: Optional[List[str]] = None
+    reported_type: Optional[str] = None
 
 
 class ClassifyResponse(BaseModel):
@@ -154,6 +140,48 @@ class AcknowledgeRequest(BaseModel):
     incident_id: str
     method: str = "app"
     responder_uid: Optional[str] = None
+
+
+class EmergencyRequest(BaseModel):
+    lat: float
+    lng: float
+    note: Optional[str] = None
+    device_id: Optional[str] = None
+    audio_url: Optional[str] = None
+    audio_duration_seconds: Optional[int] = None
+
+
+class EmergencyResponse(BaseModel):
+    ok: bool
+    incident_id: Optional[str] = None
+    short_id: Optional[str] = None
+    barangay: Optional[str] = None
+    responder_assigned: bool = False
+    sms_sent: bool = False
+    has_audio: bool = False
+    message: str = ""
+
+
+class InviteResponderRequest(BaseModel):
+    fullName: str = Field(..., min_length=2)
+    phone: str = Field(..., min_length=10)
+    barangay: str = Field(..., min_length=2)
+    agency: Optional[str] = None
+
+
+class InviteResponderResponse(BaseModel):
+    ok: bool
+    uid: Optional[str] = None
+    tempEmail: Optional[str] = None
+    tempPassword: Optional[str] = None
+    sms_ok: bool = False
+    sms_error: Optional[str] = None
+    message: str = ""
+
+
+class ToggleUserStatusRequest(BaseModel):
+    uid: str
+    disabled: bool
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +234,7 @@ async def classify(req: ClassifyRequest) -> ClassifyResponse:
 
 
 # ---------------------------------------------------------------------------
-# Analytics — cached aggregations
+# Analytics
 # ---------------------------------------------------------------------------
 
 @app.get("/analytics/summary")
@@ -298,7 +326,7 @@ async def analytics_predictions(days: int = 90) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Dispatch incident (admin -> responder + SMS)
+# Dispatch incident (admin → responder + SMS)
 # ---------------------------------------------------------------------------
 
 @app.post("/dispatch-incident", response_model=DispatchResponse)
@@ -331,7 +359,7 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
     if not b_snap.exists:
         return DispatchResponse(
             ok=False, incident_id=req.incident_id, status="barangay_not_found",
-            message=f"Barangay '{barangay_name}' not found in Firestore.",
+            message=f"Barangay '{barangay_name}' not found.",
         )
 
     b_data = b_snap.to_dict() or {}
@@ -342,7 +370,7 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
     if not responder_uid or not responder_phone:
         return DispatchResponse(
             ok=False, incident_id=req.incident_id, status="no_responder",
-            message=f"No responder assigned to '{barangay_name}'. Assign one first.",
+            message=f"No responder assigned to '{barangay_name}'.",
         )
 
     sms_body = build_incident_sms(incident, barangay_name, req.incident_id)
@@ -412,7 +440,171 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
 
 
 # ---------------------------------------------------------------------------
-# Acknowledgement — shared core used by both ack paths
+# Anonymous emergency
+# ---------------------------------------------------------------------------
+
+def _nearest_barangay(lat: float, lng: float) -> Optional[Dict[str, Any]]:
+    """Closest barangay from the static list, using haversine distance."""
+    try:
+        from data.barangays import to_documents
+    except Exception as e:
+        print(f"[emergency] could not import barangay list: {e}")
+        return None
+
+    docs = to_documents()
+    if not docs:
+        return None
+
+    def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+        R = 6371000.0
+        to_rad = math.radians
+        d_lat = to_rad(lat2 - lat1)
+        d_lng = to_rad(lng2 - lng1)
+        a = (
+            math.sin(d_lat / 2) ** 2
+            + math.cos(to_rad(lat1))
+            * math.cos(to_rad(lat2))
+            * math.sin(d_lng / 2) ** 2
+        )
+        return 2 * R * math.asin(math.sqrt(a))
+
+    best = None
+    best_dist = float("inf")
+    for d in docs:
+        try:
+            dist = _haversine_m(lat, lng, float(d["lat"]), float(d["lng"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if dist < best_dist:
+            best_dist = dist
+            best = d
+    return best
+
+
+@app.post("/emergency", response_model=EmergencyResponse)
+async def emergency(req: EmergencyRequest) -> EmergencyResponse:
+    """
+    Anonymous 1-tap emergency.
+
+    Creates an incident with status 'emergency_pending' and priority
+    'critical'. Does NOT dispatch — the admin reviews it first.
+
+    The nearest barangay is stored as `suggestedBarangay` so the admin
+    sees the auto-detected value but can override it.
+    """
+    from firebase_admin import firestore
+
+    db = firestore.client()
+    now = datetime.now(timezone.utc)
+
+    # ---- Rate limit ----
+    if req.device_id:
+        five_min_ago = now - timedelta(minutes=5)
+        try:
+            recent = (
+                db.collection("incidents")
+                .where("deviceId", "==", req.device_id)
+                .where("anonymous", "==", True)
+                .order_by("createdAt", "desc")
+                .limit(1)
+                .stream()
+            )
+            for snap in recent:
+                data = snap.to_dict() or {}
+                created = _to_dt(data.get("createdAt"))
+                if created and created > five_min_ago:
+                    return EmergencyResponse(
+                        ok=False,
+                        incident_id=snap.id,
+                        short_id=(data.get("shortId") or "")[:6],
+                        barangay=data.get("barangay"),
+                        message="You just sent an emergency. Please wait before sending another.",
+                    )
+        except Exception as e:
+            print(f"[emergency] rate-limit check skipped: {e}")
+
+    # ---- Locate barangay ----
+    b = _nearest_barangay(req.lat, req.lng)
+    if not b:
+        return EmergencyResponse(
+            ok=False,
+            message="Could not determine your barangay. Call local emergency services.",
+        )
+
+    barangay_name = b.get("name") or "Unknown"
+
+    # ---- Create incident ----
+    incident_ref = db.collection("incidents").document()
+    incident_id = incident_ref.id
+    short_id = incident_id[:6].upper()
+
+    description = (
+        (req.note or "").strip()
+        or "Anonymous emergency — immediate assistance needed"
+    )
+
+    payload: Dict[str, Any] = {
+        "shortId": short_id,
+        "type": "emergency",
+        "description": description,
+        "barangay": barangay_name,
+        "suggestedBarangay": barangay_name,
+        "location": firestore.GeoPoint(req.lat, req.lng),
+        "citizenName": "Anonymous",
+        "citizenPhone": "",
+        "citizenUid": None,
+        "anonymous": True,
+        "deviceId": req.device_id,
+        "status": "emergency_pending",
+        "priority": "critical",
+        "createdAt": now,
+        "updatedAt": now,
+        "photoUrls": [],
+        "videoUrl": None,
+        "audioUrl": req.audio_url,
+        "audioDurationSeconds": req.audio_duration_seconds,
+        "ml": {
+            "predictedType": "emergency",
+            "predictedSeverity": "critical",
+            "confidence": 1.0,
+            "keywords": [],
+            "mentionedVehicles": [],
+            "vehicles": {},
+            "allVehicles": [],
+            "sources": ["anonymous_quick_report"],
+            "reportedType": "emergency",
+            "reportedTypeMatches": True,
+            "processedAt": now,
+        },
+    }
+
+    incident_ref.set(payload)
+
+    try:
+        from analytics_service import clear_cache
+        clear_cache()
+    except Exception:
+        pass
+
+    print(
+        f"[emergency] {short_id} received at {barangay_name} "
+        f"(audio={'yes' if req.audio_url else 'no'}) — awaiting admin dispatch"
+    )
+
+    return EmergencyResponse(
+        ok=True,
+        incident_id=incident_id,
+        short_id=short_id,
+        barangay=barangay_name,
+        responder_assigned=False,
+        sms_sent=False,
+        has_audio=bool(req.audio_url),
+        message="Emergency received. Admin is reviewing and will dispatch shortly.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Acknowledgement
 # ---------------------------------------------------------------------------
 
 def _acknowledge_incident(
@@ -420,19 +612,6 @@ def _acknowledge_incident(
     method: str,
     responder_uid: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Idempotently mark an incident acknowledged.
-
-    Writes:
-      - acknowledgedAt        (server timestamp)
-      - acknowledgedVia       ('sms_link' | 'app')
-      - acknowledgedBy        (responder uid, if supplied)
-      - responseTimeSeconds   (QRT — dispatchedAt → now)
-      - updatedAt
-
-    Also invalidates the analytics cache so the admin dashboard updates
-    immediately.
-    """
     from firebase_admin import firestore
 
     db = firestore.client()
@@ -445,14 +624,12 @@ def _acknowledge_incident(
     data = snap.to_dict() or {}
 
     if data.get("acknowledgedAt"):
+        ack_dt = _to_dt(data["acknowledgedAt"])
         return {
             "ok": True,
             "already": True,
             "incident_id": incident_id,
-            "acknowledged_at": (
-                _to_dt(data["acknowledgedAt"]).isoformat()
-                if _to_dt(data["acknowledgedAt"]) else None
-            ),
+            "acknowledged_at": ack_dt.isoformat() if ack_dt else None,
         }
 
     now = datetime.now(timezone.utc)
@@ -501,16 +678,8 @@ def _acknowledge_incident(
     }
 
 
-# ---------------------------------------------------------------------------
-# SMS link — GET /ack/{short_id}
-# ---------------------------------------------------------------------------
-
 @app.get("/ack/{short_id}", response_class=HTMLResponse)
 async def acknowledge_via_link(short_id: str) -> HTMLResponse:
-    """
-    Endpoint hit when a responder taps the acknowledgement link in the
-    dispatch SMS. No login required — the short ID is the capability.
-    """
     from firebase_admin import firestore
 
     short = (short_id or "").strip().upper()
@@ -533,8 +702,7 @@ async def acknowledge_via_link(short_id: str) -> HTMLResponse:
         return HTMLResponse(
             _ack_page(
                 "Incident not found",
-                f"No incident matches reference <strong>{short}</strong>. "
-                "It may have been removed.",
+                f"No incident matches reference <strong>{short}</strong>.",
                 ok=False,
             ),
             status_code=404,
@@ -552,8 +720,7 @@ async def acknowledge_via_link(short_id: str) -> HTMLResponse:
     if result.get("already"):
         return HTMLResponse(_ack_page(
             "Already acknowledged",
-            f"Incident <strong>{short}</strong> was already acknowledged. "
-            "No action needed.",
+            f"Incident <strong>{short}</strong> was already acknowledged.",
             ok=True,
         ))
 
@@ -567,7 +734,6 @@ async def acknowledge_via_link(short_id: str) -> HTMLResponse:
 
 
 def _ack_page(title: str, body: str, ok: bool) -> str:
-    """Minimal, mobile-first confirmation page for the SMS ack link."""
     accent = "#2f9e73" if ok else "#e63946"
     icon = "✓" if ok else "!"
     return f"""<!doctype html>
@@ -579,22 +745,16 @@ def _ack_page(title: str, body: str, ok: bool) -> str:
   <style>
     * {{ box-sizing: border-box; }}
     body {{
-      margin: 0;
-      min-height: 100dvh;
-      display: grid;
-      place-items: center;
-      background: #0b1220;
-      color: #eaf0fa;
+      margin: 0; min-height: 100dvh;
+      display: grid; place-items: center;
+      background: #0b1220; color: #eaf0fa;
       font: 16px/1.5 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
       padding: 24px;
     }}
     .card {{
-      max-width: 420px;
-      width: 100%;
-      background: #121c2e;
-      border: 1px solid #22304a;
-      border-radius: 18px;
-      padding: 32px 24px;
+      max-width: 420px; width: 100%;
+      background: #121c2e; border: 1px solid #22304a;
+      border-radius: 18px; padding: 32px 24px;
       text-align: center;
       box-shadow: 0 20px 60px rgba(0,0,0,.5);
     }}
@@ -603,20 +763,16 @@ def _ack_page(title: str, body: str, ok: bool) -> str:
       border-radius: 50%;
       display: grid; place-items: center;
       margin: 0 auto 20px;
-      font-size: 32px;
-      font-weight: 800;
-      color: #fff;
-      background: {accent};
+      font-size: 32px; font-weight: 800;
+      color: #fff; background: {accent};
       box-shadow: 0 8px 24px {accent}55;
     }}
     h1 {{ font-size: 1.375rem; margin: 0 0 10px; letter-spacing: -0.01em; }}
     p  {{ margin: 0; color: #93a3bd; line-height: 1.55; }}
     strong {{ color: #eaf0fa; }}
     .brand {{
-      margin-top: 24px;
-      font-size: 0.75rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
+      margin-top: 24px; font-size: 0.75rem;
+      letter-spacing: 0.08em; text-transform: uppercase;
       color: #64748b;
     }}
   </style>
@@ -632,18 +788,8 @@ def _ack_page(title: str, body: str, ok: bool) -> str:
 </html>"""
 
 
-# ---------------------------------------------------------------------------
-# Acknowledgement — POST /acknowledge (used by responder app)
-# ---------------------------------------------------------------------------
-
 @app.post("/acknowledge")
 async def acknowledge(req: AcknowledgeRequest) -> Dict[str, Any]:
-    """
-    Called by the responder PWA when a responder taps "Accept".
-
-    Idempotent. Writes acknowledgedAt, responseTimeSeconds, and flips
-    status to 'accepted' when method == 'app'.
-    """
     return _acknowledge_incident(
         incident_id=req.incident_id,
         method=req.method or "app",
@@ -652,12 +798,12 @@ async def acknowledge(req: AcknowledgeRequest) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# SMS webhook — legacy "YES" reply path (still supported)
+# SMS webhook (legacy "YES" reply path)
 # ---------------------------------------------------------------------------
 
 @app.post("/sms/webhook")
 async def sms_webhook(request: Request) -> Dict[str, Any]:
-    from sms_webhook import parse_incoming
+    from sms_webhook import parse_incoming, match_and_acknowledge
 
     content_type = (request.headers.get("content-type") or "").lower()
 
@@ -695,7 +841,6 @@ async def sms_webhook(request: Request) -> Dict[str, Any]:
     if not from_phone or not text:
         return {"ok": False, "error": "Missing sender or message body."}
 
-    from sms_webhook import match_and_acknowledge
     try:
         result = match_and_acknowledge(from_phone, text)
     except Exception as e:
@@ -727,23 +872,6 @@ def _random_password(length: int = 10) -> str:
 def _random_email_slug(length: int = 8) -> str:
     alphabet = _string.ascii_lowercase + _string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-class InviteResponderRequest(BaseModel):
-    fullName: str = Field(..., min_length=2)
-    phone: str = Field(..., min_length=10)
-    barangay: str = Field(..., min_length=2)
-    agency: Optional[str] = None
-
-
-class InviteResponderResponse(BaseModel):
-    ok: bool
-    uid: Optional[str] = None
-    tempEmail: Optional[str] = None
-    tempPassword: Optional[str] = None
-    sms_ok: bool = False
-    sms_error: Optional[str] = None
-    message: str = ""
 
 
 @app.post("/admin/invite-responder", response_model=InviteResponderResponse)
@@ -839,11 +967,6 @@ async def admin_invite_responder(req: InviteResponderRequest) -> InviteResponder
             else "Responder created, but SMS failed."
         ),
     )
-
-
-class ToggleUserStatusRequest(BaseModel):
-    uid: str
-    disabled: bool
 
 
 @app.post("/admin/toggle-user-status")
