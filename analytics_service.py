@@ -44,7 +44,7 @@ def _set_cached(key: str, value: Any) -> None:
 
 
 def clear_cache() -> None:
-    """Called by the Firestore worker when a new incident lands."""
+    """Called whenever an incident is dispatched or acknowledged."""
     with _cache_lock:
         _cache.clear()
 
@@ -179,23 +179,46 @@ def get_by_barangay(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def get_qrt(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
+    """
+    Quick Response Time stats.
+
+    Denominator: incidents that were dispatched (dispatchedAt is set
+                 on every dispatch, whether or not the SMS succeeded).
+
+    Numerator:   dispatched incidents that have acknowledgedAt set,
+                 regardless of whether the ack came from the SMS link
+                 or the responder app.
+    """
     incidents = _fetch_incidents(days)
-    dispatched = [i for i in incidents if i.get("smsSentAt")]
+
+    dispatched = [
+        i for i in incidents
+        if i.get("dispatchedAt") or i.get("smsSentAt") or i.get("verifiedAt")
+    ]
     acknowledged = [i for i in dispatched if i.get("acknowledgedAt")]
 
     qrts: List[float] = []
     for inc in acknowledged:
-        sent = _to_dt(inc.get("smsSentAt"))
+        sent = (
+            _to_dt(inc.get("dispatchedAt"))
+            or _to_dt(inc.get("smsSentAt"))
+            or _to_dt(inc.get("verifiedAt"))
+        )
         acked = _to_dt(inc.get("acknowledgedAt"))
         if sent and acked:
-            qrts.append((acked - sent).total_seconds())
+            delta = (acked - sent).total_seconds()
+            if delta >= 0:
+                qrts.append(delta)
 
     if not qrts:
         return {
             "count": 0,
             "dispatched": len(dispatched),
-            "acknowledged": 0,
-            "acknowledgment_rate": 0.0,
+            "acknowledged": len(acknowledged),
+            "acknowledgment_rate": (
+                round(len(acknowledged) / len(dispatched), 3)
+                if dispatched else 0.0
+            ),
             "avg_seconds": None,
             "median_seconds": None,
             "p90_seconds": None,
@@ -212,7 +235,10 @@ def get_qrt(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
         "count": n,
         "dispatched": len(dispatched),
         "acknowledged": len(acknowledged),
-        "acknowledgment_rate": round(len(acknowledged) / len(dispatched), 3) if dispatched else 0.0,
+        "acknowledgment_rate": (
+            round(len(acknowledged) / len(dispatched), 3)
+            if dispatched else 0.0
+        ),
         "avg_seconds": round(sum(qrts) / n, 1),
         "median_seconds": round(median, 1),
         "p90_seconds": round(qrts[p90_idx], 1),
@@ -249,7 +275,11 @@ def get_responders(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
         if inc.get("status") == "resolved":
             entry["resolved"] += 1
 
-        sent = _to_dt(inc.get("smsSentAt"))
+        sent = (
+            _to_dt(inc.get("dispatchedAt"))
+            or _to_dt(inc.get("smsSentAt"))
+            or _to_dt(inc.get("verifiedAt"))
+        )
         acked = _to_dt(inc.get("acknowledgedAt"))
         if sent and acked:
             entry["acknowledged"] += 1
