@@ -6,9 +6,6 @@ Design principles:
   - Aggregate in Python (cheap, deterministic)
   - Serve from in-memory cache between refreshes
   - Pull a rolling 90-day window by default to bound query cost
-
-Firestore reads: ~1 per cache window, vs ~80 queries per dashboard load
-if done client-side. This is the entire reason analytics live on the server.
 """
 
 import threading
@@ -87,6 +84,51 @@ def _to_dt(ts: Any) -> Optional[datetime]:
             return ts.replace(tzinfo=timezone.utc)
         return ts
     return None
+
+
+# ---------------------------------------------------------------------------
+# Acknowledgement helpers — the fix lives here
+# ---------------------------------------------------------------------------
+
+def _dispatch_time(inc: Dict[str, Any]) -> Optional[datetime]:
+    """
+    When was this incident dispatched to a responder?
+
+    Order of preference:
+      1. dispatchedAt  (new — set by the fixed /dispatch-incident)
+      2. smsSentAt     (old — set when SMS succeeded)
+      3. verifiedAt    (old — set on every dispatch, regardless of SMS)
+    """
+    return (
+        _to_dt(inc.get("dispatchedAt"))
+        or _to_dt(inc.get("smsSentAt"))
+        or _to_dt(inc.get("verifiedAt"))
+    )
+
+
+def _ack_time(inc: Dict[str, Any]) -> Optional[datetime]:
+    """
+    When was this incident acknowledged?
+
+    Accepts EITHER field:
+      - acknowledgedAt  (SMS link + new /acknowledge endpoint)
+      - acceptedAt      (responder app's existing Accept button)
+
+    This is the fix. The responder app writes acceptedAt; the SMS link
+    writes acknowledgedAt. Both mean "a responder took this incident."
+    """
+    return (
+        _to_dt(inc.get("acknowledgedAt"))
+        or _to_dt(inc.get("acceptedAt"))
+    )
+
+
+def _is_dispatched(inc: Dict[str, Any]) -> bool:
+    return _dispatch_time(inc) is not None
+
+
+def _is_acknowledged(inc: Dict[str, Any]) -> bool:
+    return _ack_time(inc) is not None
 
 
 def _severity_of(incident: Dict[str, Any]) -> str:
@@ -175,36 +217,32 @@ def get_by_barangay(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Endpoint 4 — Quick Response Time (QRT)
+# Endpoint 4 — Quick Response Time (QRT)  ← THE FIX
 # ---------------------------------------------------------------------------
 
 def get_qrt(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
     """
     Quick Response Time stats.
 
-    Denominator: incidents that were dispatched (dispatchedAt is set
-                 on every dispatch, whether or not the SMS succeeded).
+    Denominator: incidents that were dispatched
+                 (dispatchedAt OR smsSentAt OR verifiedAt exists).
 
-    Numerator:   dispatched incidents that have acknowledgedAt set,
-                 regardless of whether the ack came from the SMS link
-                 or the responder app.
+    Numerator:   dispatched incidents that were acknowledged
+                 (acknowledgedAt OR acceptedAt exists).
+
+    Both ack paths count:
+      - SMS link  → writes acknowledgedAt
+      - Responder app Accept → writes acceptedAt
     """
     incidents = _fetch_incidents(days)
 
-    dispatched = [
-        i for i in incidents
-        if i.get("dispatchedAt") or i.get("smsSentAt") or i.get("verifiedAt")
-    ]
-    acknowledged = [i for i in dispatched if i.get("acknowledgedAt")]
+    dispatched = [i for i in incidents if _is_dispatched(i)]
+    acknowledged = [i for i in dispatched if _is_acknowledged(i)]
 
     qrts: List[float] = []
     for inc in acknowledged:
-        sent = (
-            _to_dt(inc.get("dispatchedAt"))
-            or _to_dt(inc.get("smsSentAt"))
-            or _to_dt(inc.get("verifiedAt"))
-        )
-        acked = _to_dt(inc.get("acknowledgedAt"))
+        sent = _dispatch_time(inc)
+        acked = _ack_time(inc)
         if sent and acked:
             delta = (acked - sent).total_seconds()
             if delta >= 0:
@@ -275,15 +313,13 @@ def get_responders(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
         if inc.get("status") == "resolved":
             entry["resolved"] += 1
 
-        sent = (
-            _to_dt(inc.get("dispatchedAt"))
-            or _to_dt(inc.get("smsSentAt"))
-            or _to_dt(inc.get("verifiedAt"))
-        )
-        acked = _to_dt(inc.get("acknowledgedAt"))
+        sent = _dispatch_time(inc)
+        acked = _ack_time(inc)
         if sent and acked:
-            entry["acknowledged"] += 1
-            entry["qrts"].append((acked - sent).total_seconds())
+            delta = (acked - sent).total_seconds()
+            if delta >= 0:
+                entry["acknowledged"] += 1
+                entry["qrts"].append(delta)
 
     results = []
     for entry in by_responder.values():
@@ -315,6 +351,7 @@ def get_hourly_heatmap(days: int = 30) -> Dict[str, Any]:
         "window_days": days,
     }
 
+
 # ---------------------------------------------------------------------------
 # Endpoint 7 — History (raw incident list with filters)
 # ---------------------------------------------------------------------------
@@ -328,20 +365,8 @@ def get_history(
     barangay: Optional[str] = None,
     limit: int = 500,
 ) -> Dict[str, Any]:
-    """
-    Return a filtered, sorted list of incidents for the admin history view.
-
-    Filters:
-      - from_date / to_date: ISO date strings (YYYY-MM-DD), inclusive
-      - status: exact match (e.g. 'pending', 'resolved')
-      - incident_type: exact match (e.g. 'minor_collision')
-      - barangay: substring match (case-insensitive)
-
-    Returns the incidents sorted newest-first, capped at `limit`.
-    """
     incidents = _fetch_incidents(days)
 
-    # ---- Date range filter ----
     from_dt = None
     to_dt = None
     if from_date:
@@ -353,7 +378,6 @@ def get_history(
             pass
     if to_date:
         try:
-            # Inclusive end-of-day
             to_dt = datetime.strptime(to_date, "%Y-%m-%d").replace(
                 hour=23, minute=59, second=59, tzinfo=timezone.utc
             )
@@ -383,6 +407,8 @@ def get_history(
             if barangay.lower() not in b:
                 continue
 
+        ack_dt = _ack_time(inc)
+
         filtered.append({
             "id": inc.get("id"),
             "createdAt": created.isoformat(),
@@ -394,18 +420,17 @@ def get_history(
             "citizenName": inc.get("citizenName") or "",
             "citizenPhone": inc.get("citizenPhone") or "",
             "description": inc.get("description") or "",
-            "responderName": inc.get("assignedResponderName") or inc.get("responderName") or "",
-            "acknowledgedAt": (
-                _to_dt(inc.get("acknowledgedAt")).isoformat()
-                if _to_dt(inc.get("acknowledgedAt"))
-                else None
+            "responderName": (
+                inc.get("assignedResponderName")
+                or inc.get("responderName")
+                or ""
             ),
+            "acknowledgedAt": ack_dt.isoformat() if ack_dt else None,
             "responseTimeSeconds": inc.get("responseTimeSeconds"),
             "photoCount": len(inc.get("photoUrls") or []),
             "hasVideo": bool(inc.get("videoUrl")),
         })
 
-    # Sort newest first
     filtered.sort(key=lambda x: x["createdAt"], reverse=True)
 
     total = len(filtered)
@@ -418,6 +443,7 @@ def get_history(
         "limit": limit,
     }
 
+
 # ===========================================================================
 # ML CAPSTONE ANALYTICS
 # ===========================================================================
@@ -427,14 +453,13 @@ _PH_TZ = timezone(_timedelta(hours=8))  # UTC+8
 
 
 def _ph_parts(ts: Any) -> Optional[Dict[str, int]]:
-    """Convert a timestamp to PH (UTC+8) hour/day/date components."""
     dt = _to_dt(ts)
     if not dt:
         return None
     ph = dt.astimezone(_PH_TZ)
     return {
         "hour": ph.hour,
-        "dow": ph.weekday(),          # 0 = Monday
+        "dow": ph.weekday(),
         "date": ph.strftime("%Y-%m-%d"),
         "month": ph.strftime("%Y-%m"),
         "week": ph.strftime("%Y-W%V"),
@@ -446,10 +471,6 @@ def _ph_parts(ts: Any) -> Optional[Dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 def get_barangay_temporal(days: int = 90) -> Dict[str, Any]:
-    """
-    Barangay × hour-of-day + day-of-week matrix for heatmap visualization.
-    Includes each barangay's peak hour, top incident type, and daily counts.
-    """
     from collections import Counter, defaultdict
 
     incidents = _fetch_incidents(days)
@@ -504,9 +525,6 @@ def get_barangay_temporal(days: int = 90) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def get_vehicle_analytics(days: int = 90) -> Dict[str, Any]:
-    """
-    Vehicle detection analytics combining YOLO image detections + Gemini text.
-    """
     from collections import Counter, defaultdict
 
     incidents = _fetch_incidents(days)
@@ -584,13 +602,10 @@ def get_vehicle_analytics(days: int = 90) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# ML 3 — ML performance (accuracy + calibration)
+# ML 3 — ML performance
 # ---------------------------------------------------------------------------
 
 def get_ml_performance(days: int = 90) -> Dict[str, Any]:
-    """
-    ML accuracy, confusion matrix, and confidence calibration.
-    """
     from collections import Counter, defaultdict
 
     incidents = _fetch_incidents(days)
@@ -723,13 +738,10 @@ def get_ml_performance(days: int = 90) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# ML 4 — Pattern discovery (statistical trends)
+# ML 4 — Pattern discovery
 # ---------------------------------------------------------------------------
 
 def get_patterns(days: int = 180) -> Dict[str, Any]:
-    """
-    Statistical pattern analysis: day-of-week, hour-of-day, monthly, weekly.
-    """
     from collections import Counter, defaultdict
 
     incidents = _fetch_incidents(days)
@@ -784,9 +796,6 @@ def get_patterns(days: int = 180) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def get_predictions(days: int = 90) -> Dict[str, Any]:
-    """
-    Simple moving-average forecasting for next week + barangay trends.
-    """
     from collections import Counter, defaultdict
 
     incidents = _fetch_incidents(days)
