@@ -102,6 +102,10 @@ def _is_acknowledged(inc: Dict[str, Any]) -> bool:
     return _ack_time(inc) is not None
 
 
+def _is_resolved(inc: Dict[str, Any]) -> bool:
+    return inc.get("status") == "resolved"
+
+
 def _severity_of(incident: Dict[str, Any]) -> str:
     ml = incident.get("ml") or {}
     return (ml.get("predictedSeverity") or "medium").lower()
@@ -122,10 +126,17 @@ def get_summary(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
     by_type: Counter = Counter()
     by_severity: Counter = Counter()
 
+    resolved_count = 0
+    acknowledged_count = 0
+
     for inc in incidents:
         by_status[inc.get("status", "unknown")] += 1
         by_type[_type_of(inc)] += 1
         by_severity[_severity_of(inc)] += 1
+        if _is_resolved(inc):
+            resolved_count += 1
+        if _is_acknowledged(inc):
+            acknowledged_count += 1
 
     open_statuses = {
         "unverified",
@@ -137,9 +148,14 @@ def get_summary(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
     }
     open_count = sum(v for k, v in by_status.items() if k in open_statuses)
 
+    total = len(incidents)
+
     return {
-        "total": len(incidents),
+        "total": total,
         "open": open_count,
+        "resolved": resolved_count,
+        "acknowledged": acknowledged_count,
+        "completion_rate": round(resolved_count / total, 3) if total else 0.0,
         "by_status": dict(by_status),
         "by_type": dict(by_type),
         "by_severity": dict(by_severity),
@@ -203,51 +219,89 @@ def get_qrt(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
 
     dispatched = [i for i in incidents if _is_dispatched(i)]
     acknowledged = [i for i in dispatched if _is_acknowledged(i)]
+    resolved = [i for i in dispatched if _is_resolved(i)]
 
-    qrts: List[float] = []
+    # Ack QRT — dispatch → acknowledged/accepted
+    ack_qrts: List[float] = []
     for inc in acknowledged:
         sent = _dispatch_time(inc)
         acked = _ack_time(inc)
         if sent and acked:
             delta = (acked - sent).total_seconds()
             if delta >= 0:
-                qrts.append(delta)
+                ack_qrts.append(delta)
 
-    if not qrts:
-        return {
-            "count": 0,
-            "dispatched": len(dispatched),
-            "acknowledged": len(acknowledged),
-            "acknowledgment_rate": (
-                round(len(acknowledged) / len(dispatched), 3)
-                if dispatched else 0.0
-            ),
+    # Response duration — accept → resolved
+    response_durations: List[float] = []
+    for inc in resolved:
+        accepted = _to_dt(inc.get("acceptedAt"))
+        resolved_at = _to_dt(inc.get("resolvedAt"))
+        if accepted and resolved_at:
+            delta = (resolved_at - accepted).total_seconds()
+            if delta >= 0:
+                response_durations.append(delta)
+        else:
+            # Fall back to precomputed field
+            dur = inc.get("respondedDurationSeconds")
+            if isinstance(dur, (int, float)) and dur >= 0:
+                response_durations.append(float(dur))
+
+    result: Dict[str, Any] = {
+        "count": len(ack_qrts),
+        "dispatched": len(dispatched),
+        "acknowledged": len(acknowledged),
+        "resolved": len(resolved),
+        "acknowledgment_rate": (
+            round(len(acknowledged) / len(dispatched), 3)
+            if dispatched else 0.0
+        ),
+        "completion_rate": (
+            round(len(resolved) / len(dispatched), 3)
+            if dispatched else 0.0
+        ),
+    }
+
+    # Ack QRT stats
+    if not ack_qrts:
+        result.update({
             "avg_seconds": None,
             "median_seconds": None,
             "p90_seconds": None,
             "min_seconds": None,
             "max_seconds": None,
-        }
+        })
+    else:
+        ack_qrts.sort()
+        n = len(ack_qrts)
+        median = ack_qrts[n // 2] if n % 2 else (ack_qrts[n // 2 - 1] + ack_qrts[n // 2]) / 2
+        p90_idx = min(int(n * 0.9), n - 1)
+        result.update({
+            "avg_seconds": round(sum(ack_qrts) / n, 1),
+            "median_seconds": round(median, 1),
+            "p90_seconds": round(ack_qrts[p90_idx], 1),
+            "min_seconds": round(ack_qrts[0], 1),
+            "max_seconds": round(ack_qrts[-1], 1),
+        })
 
-    qrts.sort()
-    n = len(qrts)
-    median = qrts[n // 2] if n % 2 else (qrts[n // 2 - 1] + qrts[n // 2]) / 2
-    p90_idx = min(int(n * 0.9), n - 1)
+    # Response duration stats
+    if not response_durations:
+        result.update({
+            "avg_response_duration_seconds": None,
+            "median_response_duration_seconds": None,
+        })
+    else:
+        response_durations.sort()
+        m = len(response_durations)
+        med = (
+            response_durations[m // 2] if m % 2
+            else (response_durations[m // 2 - 1] + response_durations[m // 2]) / 2
+        )
+        result.update({
+            "avg_response_duration_seconds": round(sum(response_durations) / m, 1),
+            "median_response_duration_seconds": round(med, 1),
+        })
 
-    return {
-        "count": n,
-        "dispatched": len(dispatched),
-        "acknowledged": len(acknowledged),
-        "acknowledgment_rate": (
-            round(len(acknowledged) / len(dispatched), 3)
-            if dispatched else 0.0
-        ),
-        "avg_seconds": round(sum(qrts) / n, 1),
-        "median_seconds": round(median, 1),
-        "p90_seconds": round(qrts[p90_idx], 1),
-        "min_seconds": round(qrts[0], 1),
-        "max_seconds": round(qrts[-1], 1),
-    }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -271,12 +325,22 @@ def get_responders(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
                 "resolved": 0,
                 "acknowledged": 0,
                 "qrts": [],
+                "response_durations": [],
             }
 
         entry = by_responder[uid]
         entry["assigned"] += 1
-        if inc.get("status") == "resolved":
+
+        if _is_resolved(inc):
             entry["resolved"] += 1
+            duration = inc.get("respondedDurationSeconds")
+            if not isinstance(duration, (int, float)):
+                accepted = _to_dt(inc.get("acceptedAt"))
+                resolved_at = _to_dt(inc.get("resolvedAt"))
+                if accepted and resolved_at:
+                    duration = (resolved_at - accepted).total_seconds()
+            if isinstance(duration, (int, float)) and duration >= 0:
+                entry["response_durations"].append(float(duration))
 
         sent = _dispatch_time(inc)
         acked = _ack_time(inc)
@@ -289,10 +353,19 @@ def get_responders(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
     results = []
     for entry in by_responder.values():
         qrts = entry.pop("qrts")
+        durations = entry.pop("response_durations")
+
         entry["avg_qrts"] = round(sum(qrts) / len(qrts), 1) if qrts else None
+        entry["avg_responded_seconds"] = (
+            round(sum(durations) / len(durations), 1) if durations else None
+        )
+        entry["completion_rate"] = (
+            round(entry["resolved"] / entry["assigned"], 3)
+            if entry["assigned"] else 0.0
+        )
         results.append(entry)
 
-    results.sort(key=lambda r: (-r["assigned"], r["avg_qrts"] or 999999))
+    results.sort(key=lambda r: (-r["resolved"], -r["assigned"], r["avg_qrts"] or 999999))
     return {"responders": results[:20]}
 
 
@@ -373,6 +446,7 @@ def get_history(
                 continue
 
         ack_dt = _ack_time(inc)
+        resolved_dt = _to_dt(inc.get("resolvedAt"))
 
         filtered.append({
             "id": inc.get("id"),
@@ -391,7 +465,9 @@ def get_history(
                 or ""
             ),
             "acknowledgedAt": ack_dt.isoformat() if ack_dt else None,
+            "resolvedAt": resolved_dt.isoformat() if resolved_dt else None,
             "responseTimeSeconds": inc.get("responseTimeSeconds"),
+            "respondedDurationSeconds": inc.get("respondedDurationSeconds"),
             "photoCount": len(inc.get("photoUrls") or []),
             "hasVideo": bool(inc.get("videoUrl")),
         })
