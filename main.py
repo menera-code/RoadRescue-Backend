@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +139,11 @@ class DispatchResponse(BaseModel):
 class AcknowledgeRequest(BaseModel):
     incident_id: str
     method: str = "app"
+    responder_uid: Optional[str] = None
+
+
+class ResolveRequest(BaseModel):
+    incident_id: str
     responder_uid: Optional[str] = None
 
 
@@ -440,6 +445,76 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
 
 
 # ---------------------------------------------------------------------------
+# Resolve incident (responder marks as completed / responded)
+# ---------------------------------------------------------------------------
+
+@app.post("/resolve-incident")
+async def resolve_incident(req: ResolveRequest) -> Dict[str, Any]:
+    """
+    Called by the responder when they finish at the scene.
+
+    Idempotent. Writes status='resolved', resolvedAt, resolvedBy, and
+    respondedDurationSeconds (accept → resolve). Clears the analytics
+    cache so the admin dashboard updates immediately.
+    """
+    from firebase_admin import firestore
+
+    db = firestore.client()
+    ref = db.collection("incidents").document(req.incident_id)
+    snap = ref.get()
+
+    if not snap.exists:
+        return {"ok": False, "error": "Incident not found."}
+
+    data = snap.to_dict() or {}
+
+    if data.get("status") == "resolved":
+        return {
+            "ok": True,
+            "already": True,
+            "incident_id": req.incident_id,
+            "responded_duration_seconds": data.get("respondedDurationSeconds"),
+        }
+
+    now = datetime.now(timezone.utc)
+
+    accepted_at = _to_dt(data.get("acceptedAt"))
+    responded_duration = (
+        max(0, int((now - accepted_at).total_seconds()))
+        if accepted_at else None
+    )
+
+    payload: Dict[str, Any] = {
+        "status": "resolved",
+        "resolvedAt": now,
+        "respondedDurationSeconds": responded_duration,
+        "updatedAt": now,
+    }
+    if req.responder_uid:
+        payload["resolvedBy"] = req.responder_uid
+
+    ref.update(payload)
+
+    try:
+        from analytics_service import clear_cache
+        clear_cache()
+    except Exception:
+        pass
+
+    print(
+        f"[resolve] {req.incident_id[:6].upper()} resolved "
+        f"in {responded_duration}s"
+    )
+
+    return {
+        "ok": True,
+        "already": False,
+        "incident_id": req.incident_id,
+        "responded_duration_seconds": responded_duration,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Anonymous emergency
 # ---------------------------------------------------------------------------
 
@@ -483,19 +558,13 @@ def _nearest_barangay(lat: float, lng: float) -> Optional[Dict[str, Any]]:
 @app.post("/emergency", response_model=EmergencyResponse)
 async def emergency(req: EmergencyRequest) -> EmergencyResponse:
     """
-    Anonymous 1-tap emergency.
-
-    Creates an incident with status 'unverified' so it shows up in the
-    admin Verify tab alongside regular reports. Also tagged with
-    type='emergency' and priority='critical' so the Emergencies tab
-    (which filters by type) shows it too.
+    Anonymous 1-tap emergency with optional 10-second voice recording.
     """
     from firebase_admin import firestore
 
     db = firestore.client()
     now = datetime.now(timezone.utc)
 
-    # Rate limit
     if req.device_id:
         five_min_ago = now - timedelta(minutes=5)
         try:
@@ -521,7 +590,6 @@ async def emergency(req: EmergencyRequest) -> EmergencyResponse:
         except Exception as e:
             print(f"[emergency] rate-limit check skipped: {e}")
 
-    # Locate barangay
     b = _nearest_barangay(req.lat, req.lng)
     if not b:
         return EmergencyResponse(
@@ -531,7 +599,6 @@ async def emergency(req: EmergencyRequest) -> EmergencyResponse:
 
     barangay_name = b.get("name") or "Unknown"
 
-    # Create incident
     incident_ref = db.collection("incidents").document()
     incident_id = incident_ref.id
     short_id = incident_id[:6].upper()
@@ -554,7 +621,6 @@ async def emergency(req: EmergencyRequest) -> EmergencyResponse:
         "anonymous": True,
         "deviceId": req.device_id,
 
-        # Unverified so it shows in the admin Verify tab
         "status": "unverified",
         "priority": "critical",
 
