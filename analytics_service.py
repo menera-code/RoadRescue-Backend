@@ -1,11 +1,6 @@
 """
 Analytics service — computes aggregations over the incidents collection.
-
-Design principles:
-  - Query Firestore ONCE per cache window (60 seconds)
-  - Aggregate in Python (cheap, deterministic)
-  - Serve from in-memory cache between refreshes
-  - Pull a rolling 90-day window by default to bound query cost
+Cached for 60 seconds to bound Firestore reads.
 """
 
 import threading
@@ -41,7 +36,6 @@ def _set_cached(key: str, value: Any) -> None:
 
 
 def clear_cache() -> None:
-    """Called whenever an incident is dispatched or acknowledged."""
     with _cache_lock:
         _cache.clear()
 
@@ -50,7 +44,6 @@ DEFAULT_WINDOW_DAYS = 90
 
 
 def _fetch_incidents(days: int = DEFAULT_WINDOW_DAYS) -> List[Dict[str, Any]]:
-    """Fetch incidents from the last `days` days. Cached for 60s."""
     cache_key = f"incidents:{days}"
     cached = _get_cached(cache_key)
     if cached is not None:
@@ -86,19 +79,7 @@ def _to_dt(ts: Any) -> Optional[datetime]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Acknowledgement helpers — the fix lives here
-# ---------------------------------------------------------------------------
-
 def _dispatch_time(inc: Dict[str, Any]) -> Optional[datetime]:
-    """
-    When was this incident dispatched to a responder?
-
-    Order of preference:
-      1. dispatchedAt  (new — set by the fixed /dispatch-incident)
-      2. smsSentAt     (old — set when SMS succeeded)
-      3. verifiedAt    (old — set on every dispatch, regardless of SMS)
-    """
     return (
         _to_dt(inc.get("dispatchedAt"))
         or _to_dt(inc.get("smsSentAt"))
@@ -107,16 +88,6 @@ def _dispatch_time(inc: Dict[str, Any]) -> Optional[datetime]:
 
 
 def _ack_time(inc: Dict[str, Any]) -> Optional[datetime]:
-    """
-    When was this incident acknowledged?
-
-    Accepts EITHER field:
-      - acknowledgedAt  (SMS link + new /acknowledge endpoint)
-      - acceptedAt      (responder app's existing Accept button)
-
-    This is the fix. The responder app writes acceptedAt; the SMS link
-    writes acknowledgedAt. Both mean "a responder took this incident."
-    """
     return (
         _to_dt(inc.get("acknowledgedAt"))
         or _to_dt(inc.get("acceptedAt"))
@@ -142,7 +113,7 @@ def _type_of(incident: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Endpoint 1 — Summary
+# Summary
 # ---------------------------------------------------------------------------
 
 def get_summary(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
@@ -156,7 +127,14 @@ def get_summary(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
         by_type[_type_of(inc)] += 1
         by_severity[_severity_of(inc)] += 1
 
-    open_statuses = {"unverified", "pending", "accepted", "en_route", "on_scene"}
+    open_statuses = {
+        "unverified",
+        "pending",
+        "emergency_pending",
+        "accepted",
+        "en_route",
+        "on_scene",
+    }
     open_count = sum(v for k, v in by_status.items() if k in open_statuses)
 
     return {
@@ -171,7 +149,7 @@ def get_summary(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Endpoint 2 — Timeline
+# Timeline
 # ---------------------------------------------------------------------------
 
 def get_timeline(days: int = 30) -> Dict[str, Any]:
@@ -201,7 +179,7 @@ def get_timeline(days: int = 30) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Endpoint 3 — By barangay
+# By barangay
 # ---------------------------------------------------------------------------
 
 def get_by_barangay(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
@@ -217,23 +195,10 @@ def get_by_barangay(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Endpoint 4 — Quick Response Time (QRT)  ← THE FIX
+# QRT
 # ---------------------------------------------------------------------------
 
 def get_qrt(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
-    """
-    Quick Response Time stats.
-
-    Denominator: incidents that were dispatched
-                 (dispatchedAt OR smsSentAt OR verifiedAt exists).
-
-    Numerator:   dispatched incidents that were acknowledged
-                 (acknowledgedAt OR acceptedAt exists).
-
-    Both ack paths count:
-      - SMS link  → writes acknowledgedAt
-      - Responder app Accept → writes acceptedAt
-    """
     incidents = _fetch_incidents(days)
 
     dispatched = [i for i in incidents if _is_dispatched(i)]
@@ -286,7 +251,7 @@ def get_qrt(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Endpoint 5 — Responder leaderboard
+# Responders
 # ---------------------------------------------------------------------------
 
 def get_responders(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
@@ -332,7 +297,7 @@ def get_responders(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Endpoint 6 — Hourly heatmap
+# Hourly heatmap
 # ---------------------------------------------------------------------------
 
 def get_hourly_heatmap(days: int = 30) -> Dict[str, Any]:
@@ -353,7 +318,7 @@ def get_hourly_heatmap(days: int = 30) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Endpoint 7 — History (raw incident list with filters)
+# History
 # ---------------------------------------------------------------------------
 
 def get_history(
@@ -449,7 +414,7 @@ def get_history(
 # ===========================================================================
 
 from datetime import timedelta as _timedelta
-_PH_TZ = timezone(_timedelta(hours=8))  # UTC+8
+_PH_TZ = timezone(_timedelta(hours=8))
 
 
 def _ph_parts(ts: Any) -> Optional[Dict[str, int]]:
@@ -465,10 +430,6 @@ def _ph_parts(ts: Any) -> Optional[Dict[str, int]]:
         "week": ph.strftime("%Y-W%V"),
     }
 
-
-# ---------------------------------------------------------------------------
-# ML 1 — Barangay × temporal heatmap
-# ---------------------------------------------------------------------------
 
 def get_barangay_temporal(days: int = 90) -> Dict[str, Any]:
     from collections import Counter, defaultdict
@@ -519,10 +480,6 @@ def get_barangay_temporal(days: int = 90) -> Dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-
-# ---------------------------------------------------------------------------
-# ML 2 — Vehicle detection analytics
-# ---------------------------------------------------------------------------
 
 def get_vehicle_analytics(days: int = 90) -> Dict[str, Any]:
     from collections import Counter, defaultdict
@@ -600,10 +557,6 @@ def get_vehicle_analytics(days: int = 90) -> Dict[str, Any]:
         "window_days": days,
     }
 
-
-# ---------------------------------------------------------------------------
-# ML 3 — ML performance
-# ---------------------------------------------------------------------------
 
 def get_ml_performance(days: int = 90) -> Dict[str, Any]:
     from collections import Counter, defaultdict
@@ -737,10 +690,6 @@ def get_ml_performance(days: int = 90) -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# ML 4 — Pattern discovery
-# ---------------------------------------------------------------------------
-
 def get_patterns(days: int = 180) -> Dict[str, Any]:
     from collections import Counter, defaultdict
 
@@ -790,10 +739,6 @@ def get_patterns(days: int = 180) -> Dict[str, Any]:
         "window_days": days,
     }
 
-
-# ---------------------------------------------------------------------------
-# ML 5 — Predictive insights
-# ---------------------------------------------------------------------------
 
 def get_predictions(days: int = 90) -> Dict[str, Any]:
     from collections import Counter, defaultdict
