@@ -58,14 +58,26 @@ def _ascii_safe(text: str) -> str:
     return "".join(c if 32 <= ord(c) < 127 else "" for c in text)
 
 
-def build_incident_sms(incident: dict, barangay: str) -> str:
+def build_incident_sms(
+    incident: dict,
+    barangay: str,
+    incident_id: str,
+) -> str:
     """
     Format a formal dispatch SMS with a deep link for acknowledgment.
 
-    The ack URL opens the responder's app (PWA) directly on the incident.
-    We use the base URL from FRONTEND_URL env var so dev/prod both work.
+    The ack URL hits the BACKEND directly — no login required. When the
+    responder taps it, the backend marks the incident acknowledged and
+    returns a small confirmation page. This is what feeds the analytics
+    acknowledgement rate.
+
+    Args:
+        incident:    The incident document data (from Firestore).
+        barangay:    Barangay name for display.
+        incident_id: The Firestore document ID. MUST be passed in —
+                     snap.to_dict() does not include the ID.
     """
-    short_id = (incident.get("id") or "")[:6].upper()
+    short_id = (incident_id or "")[:6].upper()
     incident_type = incident.get("type", "other")
     label = TYPE_LABELS.get(incident_type, "Incident")
 
@@ -85,9 +97,14 @@ def build_incident_sms(incident: dict, barangay: str) -> str:
     citizen_name = (incident.get("citizenName") or "").strip()
     citizen_phone = (incident.get("citizenPhone") or "").strip()
 
-    # Base URL from env — localhost in dev, deployed URL in production
-    base_url = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
-    ack_url = f"{base_url}/dashboard?ack={short_id}"
+    # Backend URL — the SMS link hits the backend directly, so no login
+    # is required to acknowledge. Fall back to FRONTEND_URL if not set.
+    backend_url = (
+        os.getenv("BACKEND_URL")
+        or os.getenv("FRONTEND_URL")
+        or "http://127.0.0.1:8000"
+    ).rstrip("/")
+    ack_url = f"{backend_url}/ack/{short_id}"
 
     # ---- Compose the SMS ----
     lines = [
@@ -114,6 +131,7 @@ def build_incident_sms(incident: dict, barangay: str) -> str:
     lines.append(f"Ack: {ack_url}")
 
     return _ascii_safe("\n".join(lines))
+
 
 def send_incident_sms(
     to_phone: str,
