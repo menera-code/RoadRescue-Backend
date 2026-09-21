@@ -8,18 +8,12 @@ Body format: application/x-www-form-urlencoded
 Two modes:
   - Stub mode  → MOCEAN_API_TOKEN not set, logs the SMS locally
   - Live mode  → MOCEAN_API_TOKEN is set, sends real SMS
-
-Encoding notes:
-  PH carriers often mangle non-ASCII characters (emojis, accented letters)
-  into "?". The message body must be PLAIN ASCII to survive GSM-7 encoding.
-  This module guarantees that all output is 7-bit safe.
 """
 
 import os
 from typing import Any, Dict
 
 
-# Human-readable labels for incident types
 TYPE_LABELS = {
     "flat_tire":       "Flat Tire",
     "battery":         "Dead Battery",
@@ -29,32 +23,24 @@ TYPE_LABELS = {
     "major_collision": "Major Crash",
     "vehicle_fire":    "Vehicle Fire",
     "road_hazard":     "Road Hazard",
+    "emergency":       "EMERGENCY",
     "other":           "Incident",
 }
 
 
 def _ascii_safe(text: str) -> str:
-    """
-    Force a string into GSM-7 safe ASCII.
-
-    Replaces common unicode punctuation with ASCII equivalents
-    (em dash → hyphen, smart quotes → straight quotes, ellipsis → dots)
-    and drops anything else that can't be encoded.
-    """
     if not text:
         return ""
     replacements = {
-        "\u2018": "'", "\u2019": "'",   # smart single quotes
-        "\u201c": '"', "\u201d": '"',   # smart double quotes
-        "\u2013": "-", "\u2014": "-",   # en/em dash
-        "\u2026": "...",                # ellipsis
-        "\u00a0": " ",                  # non-breaking space
-        "\u2022": "*",                  # bullet
+        "\u2018": "'", "\u2019": "'",
+        "\u201c": '"', "\u201d": '"',
+        "\u2013": "-", "\u2014": "-",
+        "\u2026": "...",
+        "\u00a0": " ",
+        "\u2022": "*",
     }
     for k, v in replacements.items():
         text = text.replace(k, v)
-
-    # Drop everything outside printable ASCII
     return "".join(c if 32 <= ord(c) < 127 else "" for c in text)
 
 
@@ -65,17 +51,7 @@ def build_incident_sms(
 ) -> str:
     """
     Format a formal dispatch SMS with a deep link for acknowledgment.
-
-    The ack URL hits the BACKEND directly — no login required. When the
-    responder taps it, the backend marks the incident acknowledged and
-    returns a small confirmation page. This is what feeds the analytics
-    acknowledgement rate.
-
-    Args:
-        incident:    The incident document data (from Firestore).
-        barangay:    Barangay name for display.
-        incident_id: The Firestore document ID. MUST be passed in —
-                     snap.to_dict() does not include the ID.
+    Emergency incidents get a distinct, high-visibility format.
     """
     short_id = (incident_id or "")[:6].upper()
     incident_type = incident.get("type", "other")
@@ -97,8 +73,6 @@ def build_incident_sms(
     citizen_name = (incident.get("citizenName") or "").strip()
     citizen_phone = (incident.get("citizenPhone") or "").strip()
 
-    # Backend URL — the SMS link hits the backend directly, so no login
-    # is required to acknowledge. Fall back to FRONTEND_URL if not set.
     backend_url = (
         os.getenv("BACKEND_URL")
         or os.getenv("FRONTEND_URL")
@@ -106,7 +80,25 @@ def build_incident_sms(
     ).rstrip("/")
     ack_url = f"{backend_url}/ack/{short_id}"
 
-    # ---- Compose the SMS ----
+    # ---- Emergency format ----
+    if incident_type == "emergency":
+        lines = [
+            "!! ROADRESCUE EMERGENCY !!",
+            f"Ref {short_id}",
+            "",
+            "ANONYMOUS SOS - RESPOND IMMEDIATELY",
+            f"Location  {barangay}",
+            "Severity  CRITICAL",
+        ]
+        if incident.get("audioUrl"):
+            lines.append("Voice     Message attached (see admin)")
+        if desc:
+            lines.append(f'Note      "{desc}"')
+        lines.append("")
+        lines.append(f"Ack: {ack_url}")
+        return _ascii_safe("\n".join(lines))
+
+    # ---- Normal dispatch format ----
     lines = [
         f"ROADRESCUE DISPATCH  Ref {short_id}",
         "",
@@ -139,22 +131,11 @@ def send_incident_sms(
     incident_id: str,
 ) -> Dict[str, Any]:
     """
-    Send an SMS alert about an incident.
-
-    Uses Bearer token auth (MOCEAN's current API).
-
-    Returns:
-        {
-            "ok": bool,
-            "provider": "stub" | "mocean",
-            "messageId": str | None,
-            "to": str,
-            "error": str | None,
-        }
+    Send an SMS alert about an incident via MOCEAN (or stub).
     """
     token = os.getenv("MOCEAN_API_TOKEN", "").strip()
 
-    # ---- Stub mode when no token ----
+    # ---- Stub mode ----
     if not token:
         print(f"[sms][stub] -> {to_phone}")
         print(f"[sms][stub]")
@@ -168,19 +149,15 @@ def send_incident_sms(
             "error": None,
         }
 
-    # ---- Real MOCEAN mode ----
+    # ---- Real MOCEAN ----
     try:
         import requests
 
         sender = os.getenv("MOCEAN_SENDER", "MOCEAN")
-
-        # Normalize phone: digits only, no +, no spaces, no dashes
         phone = to_phone.replace("+", "").replace(" ", "").replace("-", "")
-        # If it starts with 0 (local format), prepend 63
         if phone.startswith("0"):
             phone = "63" + phone[1:]
 
-        # Final encoding safety check
         safe_message = _ascii_safe(message)
 
         resp = requests.post(
@@ -204,14 +181,10 @@ def send_incident_sms(
         resp.raise_for_status()
         data = resp.json()
 
-        # MOCEAN response shapes vary — handle several
         messages = data.get("messages") or []
         first = messages[0] if messages else {}
-
-        # status 0 = queued, 1 = sent, others = error
         status_code = first.get("status", 0)
         message_id = first.get("msgid") or first.get("id")
-
         ok = status_code in (0, 1)
 
         return {
