@@ -93,6 +93,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register admin user management router
+from admin_users import router as admin_users_router
+app.include_router(admin_users_router)
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -164,23 +168,6 @@ class EmergencyResponse(BaseModel):
     responder_assigned: bool = False
     sms_sent: bool = False
     has_audio: bool = False
-    message: str = ""
-
-
-class InviteResponderRequest(BaseModel):
-    fullName: str = Field(..., min_length=2)
-    phone: str = Field(..., min_length=10)
-    barangay: str = Field(..., min_length=2)
-    agency: Optional[str] = None
-
-
-class InviteResponderResponse(BaseModel):
-    ok: bool
-    uid: Optional[str] = None
-    tempEmail: Optional[str] = None
-    tempPassword: Optional[str] = None
-    sms_ok: bool = False
-    sms_error: Optional[str] = None
     message: str = ""
 
 
@@ -445,18 +432,11 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
 
 
 # ---------------------------------------------------------------------------
-# Resolve incident (responder marks as completed / responded)
+# Resolve incident
 # ---------------------------------------------------------------------------
 
 @app.post("/resolve-incident")
 async def resolve_incident(req: ResolveRequest) -> Dict[str, Any]:
-    """
-    Called by the responder when they finish at the scene.
-
-    Idempotent. Writes status='resolved', resolvedAt, resolvedBy, and
-    respondedDurationSeconds (accept → resolve). Clears the analytics
-    cache so the admin dashboard updates immediately.
-    """
     from firebase_admin import firestore
 
     db = firestore.client()
@@ -557,9 +537,6 @@ def _nearest_barangay(lat: float, lng: float) -> Optional[Dict[str, Any]]:
 
 @app.post("/emergency", response_model=EmergencyResponse)
 async def emergency(req: EmergencyRequest) -> EmergencyResponse:
-    """
-    Anonymous 1-tap emergency with optional 10-second voice recording.
-    """
     from firebase_admin import firestore
 
     db = firestore.client()
@@ -923,117 +900,8 @@ async def sms_webhook(request: Request) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# ADMIN — User management
+# ADMIN — Toggle user status (kept for compatibility)
 # ---------------------------------------------------------------------------
-
-import secrets
-import string as _string
-
-
-def _random_password(length: int = 10) -> str:
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-def _random_email_slug(length: int = 8) -> str:
-    alphabet = _string.ascii_lowercase + _string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-@app.post("/admin/invite-responder", response_model=InviteResponderResponse)
-async def admin_invite_responder(req: InviteResponderRequest) -> InviteResponderResponse:
-    from firebase_admin import auth as fb_auth, firestore
-    from sms_service import send_incident_sms
-
-    db = firestore.client()
-
-    temp_email = f"responder-{_random_email_slug()}@invite.roadrescue.app"
-    temp_password = _random_password()
-
-    try:
-        user = fb_auth.create_user(
-            email=temp_email,
-            password=temp_password,
-            display_name=req.fullName,
-        )
-    except Exception as e:
-        return InviteResponderResponse(
-            ok=False,
-            message=f"Failed to create user: {str(e)[:120]}",
-        )
-
-    now = datetime.now(timezone.utc)
-    db.collection("users").document(user.uid).set({
-        "uid": user.uid,
-        "fullName": req.fullName,
-        "email": temp_email,
-        "phone": req.phone,
-        "role": "responder",
-        "status": "active",
-        "agency": req.agency or "",
-        "badgeId": "",
-        "barangay": req.barangay,
-        "assignedBarangay": req.barangay,
-        "disabled": False,
-        "lastSeen": None,
-        "mustChangeCredentials": True,
-        "invitedBy": "admin",
-        "invitedAt": now,
-        "termsAccepted": True,
-        "termsVersion": "1.0.0",
-        "termsAcceptedAt": now,
-        "createdAt": now,
-        "updatedAt": now,
-    })
-
-    try:
-        slug = slugify_py(req.barangay)
-        db.collection("barangays").document(slug).update({
-            "responderUid": user.uid,
-            "responderName": req.fullName,
-            "responderPhone": req.phone,
-            "assignedAt": now,
-            "updatedAt": now,
-        })
-    except Exception as e:
-        print(f"[invite] barangay mirror failed: {e}")
-
-    sms_body = (
-        "ROADRESCUE RESPONDER INVITATION\n"
-        "\n"
-        "You have been invited as a responder.\n"
-        "\n"
-        "Login credentials:\n"
-        f"Email:    {temp_email}\n"
-        f"Password: {temp_password}\n"
-        "\n"
-        "Open the app and sign in. You will be\n"
-        "asked to set your real email and password\n"
-        "on first login.\n"
-        "\n"
-        "--\n"
-        "RoadRescue Response System"
-    )
-    sms_result = send_incident_sms(
-        to_phone=req.phone,
-        message=sms_body,
-        incident_id=f"invite-{user.uid[:6]}",
-    )
-
-    return InviteResponderResponse(
-        ok=True,
-        uid=user.uid,
-        tempEmail=temp_email,
-        tempPassword=temp_password,
-        sms_ok=sms_result["ok"],
-        sms_error=sms_result.get("error"),
-        message=(
-            "Responder invited and SMS sent."
-            if sms_result["ok"]
-            else "Responder created, but SMS failed."
-        ),
-    )
-
 
 @app.post("/admin/toggle-user-status")
 async def admin_toggle_user_status(req: ToggleUserStatusRequest) -> Dict[str, Any]:
@@ -1049,6 +917,7 @@ async def admin_toggle_user_status(req: ToggleUserStatusRequest) -> Dict[str, An
     try:
         db.collection("users").document(req.uid).update({
             "disabled": req.disabled,
+            "status": "suspended" if req.disabled else "active",
             "updatedAt": datetime.now(timezone.utc),
         })
     except Exception as e:
