@@ -400,54 +400,97 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
         )
 
     b_data = b_snap.to_dict() or {}
-    responder_uid = b_data.get("responderUid")
-    responder_name = b_data.get("responderName")
-    responder_phone = b_data.get("responderPhone")
 
-    if not responder_uid or not responder_phone:
+    # ---- Collect responders (multi-responder model + legacy fallback) ----
+    responders = []
+    if isinstance(b_data.get("responders"), list):
+        responders = [
+            r for r in b_data["responders"]
+            if isinstance(r, dict) and r.get("uid") and r.get("phone")
+        ]
+    # Legacy fallback: single responder assigned on the old schema
+    if not responders and b_data.get("responderUid") and b_data.get("responderPhone"):
+        responders = [{
+            "uid": b_data["responderUid"],
+            "name": b_data.get("responderName") or "",
+            "phone": b_data["responderPhone"],
+        }]
+
+    if not responders:
         return DispatchResponse(
             ok=False, incident_id=req.incident_id, status="no_responder",
-            message=f"No responder assigned to '{barangay_name}'.",
+            message=f"No responders assigned to '{barangay_name}'.",
         )
 
+    # ---- Build SMS body once; send to every responder ----
     sms_body = build_incident_sms(incident, barangay_name, req.incident_id)
-    sms_result = send_incident_sms(
-        to_phone=responder_phone,
-        message=sms_body,
-        incident_id=req.incident_id,
-    )
+
+    sms_results = []
+    for r in responders:
+        try:
+            result = send_incident_sms(
+                to_phone=r["phone"],
+                message=sms_body,
+                incident_id=req.incident_id,
+            )
+        except Exception as e:
+            result = {
+                "ok": False,
+                "provider": "error",
+                "messageId": None,
+                "error": str(e)[:200],
+            }
+        sms_results.append({"responder": r, "result": result})
+
+    any_ok = any(sr["result"].get("ok") for sr in sms_results)
+    ok_count = sum(1 for sr in sms_results if sr["result"].get("ok"))
 
     now = datetime.now(timezone.utc)
     short_id = req.incident_id[:6].upper()
 
+    # ---- Persist: store arrays + legacy first-responder mirror ----
+    first = responders[0]
     incident_ref.update({
         "status": "pending",
         "shortId": short_id,
-        "assignedResponderUid": responder_uid,
-        "assignedResponderName": responder_name,
-        "assignedResponderPhone": responder_phone,
+
+        # Multi-responder fields (new)
+        "assignedResponderUids":  [r["uid"] for r in responders],
+        "assignedResponderNames": [r.get("name") or "" for r in responders],
+        "assignedResponderPhones": [r["phone"] for r in responders],
+
+        # Legacy single-responder mirror (first in list)
+        "assignedResponderUid":   first["uid"],
+        "assignedResponderName":  first.get("name") or "",
+        "assignedResponderPhone": first["phone"],
+
         "verifiedAt": now,
         "dispatchedAt": now,
-        "smsSent": sms_result["ok"],
-        "smsSentAt": now if sms_result["ok"] else None,
-        "smsProvider": sms_result["provider"],
-        "smsMessageId": sms_result["messageId"],
-        "smsError": sms_result.get("error"),
+        "smsSent": any_ok,
+        "smsSentAt": now if any_ok else None,
+        "smsProvider": sms_results[0]["result"].get("provider"),
+        "smsMessageId": sms_results[0]["result"].get("messageId"),
+        "smsError": None if any_ok else sms_results[0]["result"].get("error"),
+        "smsRecipientCount": len(responders),
+        "smsSuccessCount": ok_count,
         "updatedAt": now,
     })
 
+    # ---- Per-responder notification log ----
     try:
-        db.collection("notifications").add({
-            "incidentId": req.incident_id,
-            "responderUid": responder_uid,
-            "responderPhone": responder_phone,
-            "channel": "sms",
-            "provider": sms_result["provider"],
-            "message": sms_body,
-            "ok": sms_result["ok"],
-            "error": sms_result.get("error"),
-            "createdAt": now,
-        })
+        for sr in sms_results:
+            db.collection("notifications").add({
+                "incidentId": req.incident_id,
+                "responderUid": sr["responder"]["uid"],
+                "responderPhone": sr["responder"]["phone"],
+                "responderName": sr["responder"].get("name") or "",
+                "channel": "sms",
+                "provider": sr["result"].get("provider"),
+                "message": sms_body,
+                "ok": sr["result"].get("ok", False),
+                "error": sr["result"].get("error"),
+                "createdAt": now,
+            })
     except Exception as e:
         print(f"[dispatch] notification log failed: {e}")
 
@@ -458,17 +501,21 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
         pass
 
     log_event(
-        level="success" if sms_result["ok"] else "warn",
+        level="success" if any_ok else "warn",
         category="dispatch",
         action="incident.dispatched",
-        message=f"Incident {short_id} dispatched to {responder_name}",
+        message=(
+            f"Incident {short_id} dispatched to {len(responders)} responder(s) "
+            f"in {barangay_name} ({ok_count} SMS sent)"
+        ),
         actor={"uid": "system", "role": "system"},
         target={"type": "incident", "id": req.incident_id},
         metadata={
             "barangay": barangay_name,
-            "responder_uid": responder_uid,
-            "sms_ok": sms_result["ok"],
-            "sms_provider": sms_result["provider"],
+            "responder_count": len(responders),
+            "responder_uids": [r["uid"] for r in responders],
+            "sms_ok_count": ok_count,
+            "sms_any_ok": any_ok,
         },
     )
 
@@ -476,20 +523,19 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
         ok=True,
         incident_id=req.incident_id,
         status="dispatched",
-        assigned_responder_uid=responder_uid,
-        assigned_responder_name=responder_name,
-        assigned_responder_phone=responder_phone,
-        sms_ok=sms_result["ok"],
-        sms_provider=sms_result["provider"],
-        sms_message_id=sms_result["messageId"],
-        sms_error=sms_result.get("error"),
+        assigned_responder_uid=first["uid"],
+        assigned_responder_name=first.get("name") or "",
+        assigned_responder_phone=first["phone"],
+        sms_ok=any_ok,
+        sms_provider=sms_results[0]["result"].get("provider"),
+        sms_message_id=sms_results[0]["result"].get("messageId"),
+        sms_error=None if any_ok else sms_results[0]["result"].get("error"),
         message=(
-            "Dispatched and SMS sent."
-            if sms_result["ok"]
-            else "Dispatched, but SMS failed."
+            f"Dispatched. SMS sent to {ok_count}/{len(responders)} responders."
+            if any_ok
+            else "Dispatched, but SMS failed for all responders."
         ),
     )
-
 
 # ---------------------------------------------------------------------------
 # Resolve incident
