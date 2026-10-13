@@ -94,8 +94,12 @@ app.add_middleware(
 )
 
 # Register admin user management router
-from admin_users import router as admin_users_router
+from admin_users import router as admin_users_router, me_router
 app.include_router(admin_users_router)
+app.include_router(me_router)
+
+# Logging service
+from log_service import log_event, log_from_request
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +180,15 @@ class ToggleUserStatusRequest(BaseModel):
     disabled: bool
 
 
+class ClientLogRequest(BaseModel):
+    level: str = "info"
+    category: str = "ui"
+    action: str
+    message: str = ""
+    target: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -197,6 +210,25 @@ def health() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Client log ingestion (for frontend-originated events)
+# ---------------------------------------------------------------------------
+
+@app.post("/log")
+async def ingest_client_log(req: ClientLogRequest, request: Request) -> Dict[str, Any]:
+    """Endpoint the frontend can call to write a log entry with UA captured."""
+    log_from_request(
+        request,
+        level=req.level,
+        category=req.category,
+        action=req.action,
+        message=req.message,
+        target=req.target,
+        metadata=req.metadata,
+    )
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Classify
 # ---------------------------------------------------------------------------
 
@@ -209,6 +241,19 @@ async def classify(req: ClassifyRequest) -> ClassifyResponse:
     reported_matches = None
     if req.reported_type:
         reported_matches = req.reported_type == result["predicted_type"]
+
+    log_event(
+        level="info",
+        category="ai",
+        action="classify.run",
+        message=f"ML classified as {result['predicted_type']} ({result['predicted_severity']})",
+        actor={"uid": "system", "role": "system"},
+        metadata={
+            "predicted_type": result["predicted_type"],
+            "confidence": result["confidence"],
+            "sources": result["sources"],
+        },
+    )
 
     return ClassifyResponse(
         predicted_type=result["predicted_type"],
@@ -412,6 +457,21 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
     except Exception:
         pass
 
+    log_event(
+        level="success" if sms_result["ok"] else "warn",
+        category="dispatch",
+        action="incident.dispatched",
+        message=f"Incident {short_id} dispatched to {responder_name}",
+        actor={"uid": "system", "role": "system"},
+        target={"type": "incident", "id": req.incident_id},
+        metadata={
+            "barangay": barangay_name,
+            "responder_uid": responder_uid,
+            "sms_ok": sms_result["ok"],
+            "sms_provider": sms_result["provider"],
+        },
+    )
+
     return DispatchResponse(
         ok=True,
         incident_id=req.incident_id,
@@ -480,6 +540,16 @@ async def resolve_incident(req: ResolveRequest) -> Dict[str, Any]:
         clear_cache()
     except Exception:
         pass
+
+    log_event(
+        level="success",
+        category="incident",
+        action="incident.resolved",
+        message=f"Incident {req.incident_id[:6].upper()} resolved in {responded_duration}s",
+        actor={"uid": req.responder_uid or "system", "role": "responder"},
+        target={"type": "incident", "id": req.incident_id},
+        metadata={"duration_seconds": responded_duration},
+    )
 
     print(
         f"[resolve] {req.incident_id[:6].upper()} resolved "
@@ -630,6 +700,20 @@ async def emergency(req: EmergencyRequest) -> EmergencyResponse:
     except Exception:
         pass
 
+    log_event(
+        level="error",
+        category="emergency",
+        action="emergency.received",
+        message=f"Anonymous SOS received at {barangay_name}",
+        actor={"uid": "anonymous", "role": "citizen"},
+        target={"type": "incident", "id": incident_id},
+        metadata={
+            "barangay": barangay_name,
+            "has_audio": bool(req.audio_url),
+            "device_id": req.device_id,
+        },
+    )
+
     print(
         f"[emergency] {short_id} received at {barangay_name} "
         f"(audio={'yes' if req.audio_url else 'no'}) — awaiting admin dispatch"
@@ -707,6 +791,16 @@ def _acknowledge_incident(
         clear_cache()
     except Exception:
         pass
+
+    log_event(
+        level="success",
+        category="incident",
+        action="incident.acknowledged",
+        message=f"Incident {incident_id[:6].upper()} acknowledged via {method}",
+        actor={"uid": responder_uid or "system", "role": "responder"},
+        target={"type": "incident", "id": incident_id},
+        metadata={"method": method, "response_seconds": response_seconds},
+    )
 
     print(
         f"[ack] {incident_id[:6].upper()} acknowledged via {method} "
@@ -896,11 +990,25 @@ async def sms_webhook(request: Request) -> Dict[str, Any]:
     except Exception:
         pass
 
+    log_event(
+        level="success" if result.get("matched") else "warn",
+        category="sms",
+        action="sms.webhook_received",
+        message=result.get("message") or f"Inbound SMS from {from_phone}",
+        actor={"uid": "sms", "role": "provider"},
+        target=(
+            {"type": "incident", "id": result.get("incident_id")}
+            if result.get("incident_id")
+            else None
+        ),
+        metadata={"from": from_phone, "text": text[:200]},
+    )
+
     return {"ok": True, **result}
 
 
 # ---------------------------------------------------------------------------
-# ADMIN — Toggle user status (kept for compatibility)
+# ADMIN — Toggle user status
 # ---------------------------------------------------------------------------
 
 @app.post("/admin/toggle-user-status")
@@ -922,5 +1030,15 @@ async def admin_toggle_user_status(req: ToggleUserStatusRequest) -> Dict[str, An
         })
     except Exception as e:
         return {"ok": False, "error": f"Firestore update failed: {str(e)[:120]}"}
+
+    log_event(
+        level="warn" if req.disabled else "info",
+        category="admin",
+        action="user.toggled",
+        message=f"User {req.uid} {'disabled' if req.disabled else 'enabled'}",
+        actor={"uid": "admin", "role": "admin"},
+        target={"type": "user", "id": req.uid},
+        metadata={"disabled": req.disabled},
+    )
 
     return {"ok": True, "uid": req.uid, "disabled": req.disabled}

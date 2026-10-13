@@ -20,8 +20,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 from firebase_admin import auth as fb_auth, firestore
+
+from log_service import log_event
 
 
 router = APIRouter(prefix="/admin/users", tags=["admin-users"])
@@ -70,7 +72,7 @@ VALID_STATUSES = {"active", "suspended", "pending"}
 
 
 class CreateUserRequest(BaseModel):
-    email: EmailStr
+    email: str = Field(..., min_length=5, max_length=200)
     display_name: str = Field(..., min_length=2, max_length=80)
     phone: Optional[str] = None
     role: str = "citizen"
@@ -307,6 +309,24 @@ async def create_user(
         except Exception as e:
             sms_error = str(e)[:200]
 
+    log_event(
+        level="success",
+        category="admin",
+        action="user.created",
+        message=f"Admin created {payload.role} account: {email}",
+        actor={
+            "uid": admin["uid"],
+            "email": admin.get("email"),
+            "role": "admin",
+        },
+        target={"type": "user", "id": fb_user.uid},
+        metadata={
+            "role": payload.role,
+            "has_phone": bool(normalized_phone),
+            "sms_ok": sms_ok,
+        },
+    )
+
     return {
         "ok": True,
         "uid": fb_user.uid,
@@ -428,6 +448,16 @@ async def update_user(
     except Exception:
         pass
 
+    log_event(
+        level="info",
+        category="admin",
+        action="user.updated",
+        message=f"Admin updated user {uid}: {', '.join(updates.keys())}",
+        actor={"uid": admin["uid"], "email": admin.get("email"), "role": "admin"},
+        target={"type": "user", "id": uid},
+        metadata={"fields": list(updates.keys()), "role": updates.get("role")},
+    )
+
     return {"ok": True, "uid": uid, "updated": list(updates.keys())}
 
 
@@ -470,6 +500,15 @@ async def delete_user(
 
     db.collection("users").document(uid).delete()
 
+    log_event(
+        level="warn",
+        category="admin",
+        action="user.deleted",
+        message=f"Admin deleted user {uid}",
+        actor={"uid": admin["uid"], "email": admin.get("email"), "role": "admin"},
+        target={"type": "user", "id": uid},
+    )
+
     return {"ok": True, "uid": uid}
 
 
@@ -510,6 +549,16 @@ async def request_my_update(
         "status": "pending",
         "createdAt": datetime.now(timezone.utc),
     })
+
+    log_event(
+        level="info",
+        category="user",
+        action="user.update_requested",
+        message=f"User {uid} requested profile update: {list(requested.keys())}",
+        actor={"uid": uid, "email": decoded.get("email"), "role": "user"},
+        target={"type": "user", "id": uid},
+        metadata={"fields": list(requested.keys()), "reason": payload.reason},
+    )
 
     return {"ok": True, "id": ref.id}
 
@@ -567,6 +616,16 @@ async def approve_update_request(
         "reviewedAt": datetime.now(timezone.utc),
     })
 
+    log_event(
+        level="success",
+        category="admin",
+        action="user.update_request_approved",
+        message=f"Admin approved update request {request_id} for user {data['uid']}",
+        actor={"uid": admin["uid"], "email": admin.get("email"), "role": "admin"},
+        target={"type": "user", "id": data["uid"]},
+        metadata={"request_id": request_id, "changes": list(changes.keys())},
+    )
+
     return {"ok": True, "id": request_id}
 
 
@@ -582,10 +641,132 @@ async def reject_update_request(
     if not snap.exists:
         raise HTTPException(404, "Request not found")
 
+    data = snap.to_dict() or {}
+
     ref.update({
         "status": "rejected",
         "reviewedBy": admin["uid"],
         "reviewedAt": datetime.now(timezone.utc),
     })
 
+    log_event(
+        level="warn",
+        category="admin",
+        action="user.update_request_rejected",
+        message=f"Admin rejected update request {request_id} for user {data.get('uid')}",
+        actor={"uid": admin["uid"], "email": admin.get("email"), "role": "admin"},
+        target={"type": "user", "id": data.get("uid")},
+        metadata={"request_id": request_id},
+    )
+
     return {"ok": True, "id": request_id}
+
+# =========================================================================
+# SELF-SERVICE PROFILE EDITING
+# =========================================================================
+
+me_router = APIRouter(prefix="/me", tags=["me"])
+
+
+class UpdateMyProfileRequest(BaseModel):
+    full_name: Optional[str] = Field(None, min_length=2, max_length=80)
+    phone: Optional[str] = None
+
+    agency: Optional[str] = None
+    badge_id: Optional[str] = None
+    license_number: Optional[str] = None
+    service_area: Optional[str] = None
+
+
+async def require_signed_in(
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
+    """Any signed-in user (any role)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing bearer token")
+
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        decoded = fb_auth.verify_id_token(token)
+    except Exception as e:
+        raise HTTPException(401, f"Invalid token: {e}")
+
+    return {
+        "uid": decoded["uid"],
+        "email": decoded.get("email"),
+        "role": decoded.get("role", "citizen"),
+    }
+
+
+@me_router.patch("")
+async def update_my_profile(
+    payload: UpdateMyProfileRequest,
+    user: dict = Depends(require_signed_in),
+) -> Dict[str, Any]:
+    """
+    A signed-in user updates their own profile.
+    Allowed: name, phone, and (responders only) agency, badge, license, service_area.
+    """
+    db = _db()
+    uid = user["uid"]
+    role = user["role"]
+
+    doc_ref = db.collection("users").document(uid)
+    snap = doc_ref.get()
+    if not snap.exists:
+        raise HTTPException(404, "User profile not found")
+
+    updates: Dict[str, Any] = {}
+
+    if payload.full_name is not None:
+        name = payload.full_name.strip()
+        if len(name) < 2:
+            raise HTTPException(400, "Full name must be at least 2 characters")
+        updates["fullName"] = name
+        updates["displayName"] = name
+
+    phone_norm = None
+    if payload.phone is not None:
+        phone_norm = _normalize_phone(payload.phone)
+        updates["phone"] = phone_norm or payload.phone
+
+    if role == "responder":
+        if payload.agency is not None:
+            updates["agency"] = payload.agency.strip()
+        if payload.badge_id is not None:
+            updates["badgeId"] = payload.badge_id.strip()
+        if payload.license_number is not None:
+            updates["licenseNumber"] = payload.license_number.strip()
+        if payload.service_area is not None:
+            updates["serviceArea"] = payload.service_area.strip()
+
+    if not updates:
+        return {"ok": True, "noChanges": True}
+
+    auth_updates: Dict[str, Any] = {}
+    if "fullName" in updates:
+        auth_updates["display_name"] = updates["fullName"]
+    if phone_norm:
+        auth_updates["phone_number"] = phone_norm
+
+    if auth_updates:
+        try:
+            fb_auth.update_user(uid, **auth_updates)
+        except Exception as e:
+            raise HTTPException(400, f"Failed to update auth: {str(e)[:200]}")
+
+    updates["updatedAt"] = datetime.now(timezone.utc)
+    updates["updatedBySelf"] = True
+    doc_ref.update(updates)
+
+    log_event(
+        level="success",
+        category="user",
+        action="user.self_updated",
+        message=f"User {uid} updated own profile: {list(updates.keys())}",
+        actor={"uid": uid, "email": user.get("email"), "role": role},
+        target={"type": "user", "id": uid},
+        metadata={"fields": list(updates.keys())},
+    )
+
+    return {"ok": True, "updated": list(updates.keys())}
