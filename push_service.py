@@ -11,10 +11,7 @@ def _get_key_file():
         print("[PUSH ERROR] VAPID_PRIVATE_KEY_BASE64 is missing!")
         return None
     try:
-        # Decode the Base64 string back to the PEM format
         pem_content = base64.b64decode(b64_key).decode('utf-8')
-        
-        # Write to a temporary file so pywebpush reads it without formatting issues
         temp = tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".pem")
         temp.write(pem_content)
         temp.close()
@@ -53,14 +50,15 @@ def send_push_to_responder(responder_id: str, title: str, body: str, data: dict 
         print("[PUSH ERROR] VAPID_PRIVATE_KEY_PATH is not set.")
         return False
         
-    # 👇 iOS specific payload formatting
+    # 👇 STRICT APPLE PAYLOAD 👇
+    # We ensure the data is a flat string, and we add a "tag"
     payload_data = {
         "title": title, 
         "body": body, 
-        "data": data or {},
-        "tag": "incident-alert",
-        "renotify": True
+        "url": data.get("url", "/") if data else "/", # Flatten the URL to the top level
+        "tag": "incident-assignment"
     }
+    
     payload = json.dumps(payload_data)
     
     try:
@@ -69,10 +67,6 @@ def send_push_to_responder(responder_id: str, title: str, body: str, data: dict 
             data=payload,
             vapid_private_key=VAPID_PRIVATE_KEY_PATH, 
             vapid_claims={"sub": VAPID_SUBJECT},
-            headers={
-                "Urgency": "high",          # Forces iOS to wake up
-                "Content-Encoding": "aes128gcm" # Required by Apple
-            }
         )
         print(f"[PUSH SUCCESS] Sent to {responder_id}")
         return True
