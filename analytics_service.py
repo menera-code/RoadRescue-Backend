@@ -80,9 +80,9 @@ def _to_dt(ts: Any) -> Optional[datetime]:
 
 
 def _dispatch_time(inc: Dict[str, Any]) -> Optional[datetime]:
+    # SMS removed: we only look at when the app dispatched it
     return (
         _to_dt(inc.get("dispatchedAt"))
-        or _to_dt(inc.get("smsSentAt"))
         or _to_dt(inc.get("verifiedAt"))
     )
 
@@ -211,7 +211,7 @@ def get_by_barangay(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# QRT
+# QRT (Response Time) — Now tracks App Acceptance
 # ---------------------------------------------------------------------------
 
 def get_qrt(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
@@ -221,7 +221,7 @@ def get_qrt(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
     acknowledged = [i for i in dispatched if _is_acknowledged(i)]
     resolved = [i for i in dispatched if _is_resolved(i)]
 
-    # Ack QRT — dispatch → acknowledged/accepted
+    # App Response QRT — dispatch → accepted in app
     ack_qrts: List[float] = []
     for inc in acknowledged:
         sent = _dispatch_time(inc)
@@ -261,7 +261,7 @@ def get_qrt(days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, Any]:
         ),
     }
 
-    # Ack QRT stats
+    # App Acceptance QRT stats
     if not ack_qrts:
         result.update({
             "avg_seconds": None,
