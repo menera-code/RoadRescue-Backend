@@ -137,10 +137,6 @@ class DispatchResponse(BaseModel):
     assigned_responder_uid: Optional[str] = None
     assigned_responder_name: Optional[str] = None
     assigned_responder_phone: Optional[str] = None
-    sms_ok: bool = False
-    sms_provider: Optional[str] = None
-    sms_message_id: Optional[str] = None
-    sms_error: Optional[str] = None
     message: str = ""
 
 
@@ -170,7 +166,6 @@ class EmergencyResponse(BaseModel):
     short_id: Optional[str] = None
     barangay: Optional[str] = None
     responder_assigned: bool = False
-    sms_sent: bool = False
     has_audio: bool = False
     message: str = ""
 
@@ -205,7 +200,6 @@ def health() -> Dict[str, Any]:
         "version": VERSION,
         "gemini_configured": bool(os.getenv("GEMINI_API_KEY")),
         "firebase_configured": bool(os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")),
-        "mocean_configured": bool(os.getenv("MOCEAN_API_TOKEN")),
     }
 
 
@@ -279,36 +273,30 @@ async def analytics_summary(days: int = 90) -> Dict[str, Any]:
     from analytics_service import get_summary
     return get_summary(days=days)
 
-
 @app.get("/analytics/timeline")
 async def analytics_timeline(days: int = 30) -> Dict[str, Any]:
     from analytics_service import get_timeline
     return get_timeline(days=days)
-
 
 @app.get("/analytics/by-barangay")
 async def analytics_by_barangay(days: int = 90) -> Dict[str, Any]:
     from analytics_service import get_by_barangay
     return get_by_barangay(days=days)
 
-
 @app.get("/analytics/qrt")
 async def analytics_qrt(days: int = 90) -> Dict[str, Any]:
     from analytics_service import get_qrt
     return get_qrt(days=days)
-
 
 @app.get("/analytics/responders")
 async def analytics_responders(days: int = 90) -> Dict[str, Any]:
     from analytics_service import get_responders
     return get_responders(days=days)
 
-
 @app.get("/analytics/hourly")
 async def analytics_hourly(days: int = 30) -> Dict[str, Any]:
     from analytics_service import get_hourly_heatmap
     return get_hourly_heatmap(days=days)
-
 
 @app.get("/analytics/history")
 async def analytics_history(
@@ -331,30 +319,25 @@ async def analytics_history(
         limit=limit,
     )
 
-
 @app.get("/analytics/barangay-temporal")
 async def analytics_barangay_temporal(days: int = 90) -> Dict[str, Any]:
     from analytics_service import get_barangay_temporal
     return get_barangay_temporal(days=days)
-
 
 @app.get("/analytics/vehicles")
 async def analytics_vehicles(days: int = 90) -> Dict[str, Any]:
     from analytics_service import get_vehicle_analytics
     return get_vehicle_analytics(days=days)
 
-
 @app.get("/analytics/ml-performance")
 async def analytics_ml_performance(days: int = 90) -> Dict[str, Any]:
     from analytics_service import get_ml_performance
     return get_ml_performance(days=days)
 
-
 @app.get("/analytics/patterns")
 async def analytics_patterns(days: int = 180) -> Dict[str, Any]:
     from analytics_service import get_patterns
     return get_patterns(days=days)
-
 
 @app.get("/analytics/predictions")
 async def analytics_predictions(days: int = 90) -> Dict[str, Any]:
@@ -369,7 +352,7 @@ async def analytics_predictions(days: int = 90) -> Dict[str, Any]:
 @app.post("/dispatch-incident", response_model=DispatchResponse)
 async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
     from firebase_admin import firestore
-    from sms_service import build_incident_sms, send_incident_sms
+    from push_service import send_push_to_responder
 
     db = firestore.client()
     incident_ref = db.collection("incidents").document(req.incident_id)
@@ -406,14 +389,13 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
     if isinstance(b_data.get("responders"), list):
         responders = [
             r for r in b_data["responders"]
-            if isinstance(r, dict) and r.get("uid") and r.get("phone")
+            if isinstance(r, dict) and r.get("uid")
         ]
     # Legacy fallback: single responder assigned on the old schema
-    if not responders and b_data.get("responderUid") and b_data.get("responderPhone"):
+    if not responders and b_data.get("responderUid"):
         responders = [{
             "uid": b_data["responderUid"],
             "name": b_data.get("responderName") or "",
-            "phone": b_data["responderPhone"],
         }]
 
     if not responders:
@@ -422,34 +404,12 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
             message=f"No responders assigned to '{barangay_name}'.",
         )
 
-    # ---- Build SMS body once; send to every responder ----
-    sms_body = build_incident_sms(incident, barangay_name, req.incident_id)
-
-    sms_results = []
-    for r in responders:
-        try:
-            result = send_incident_sms(
-                to_phone=r["phone"],
-                message=sms_body,
-                incident_id=req.incident_id,
-            )
-        except Exception as e:
-            result = {
-                "ok": False,
-                "provider": "error",
-                "messageId": None,
-                "error": str(e)[:200],
-            }
-        sms_results.append({"responder": r, "result": result})
-
-    any_ok = any(sr["result"].get("ok") for sr in sms_results)
-    ok_count = sum(1 for sr in sms_results if sr["result"].get("ok"))
-
     now = datetime.now(timezone.utc)
     short_id = req.incident_id[:6].upper()
 
-    # ---- Persist: store arrays + legacy first-responder mirror ----
     first = responders[0]
+    
+    # ---- Persist dispatch state to Firestore ----
     incident_ref.update({
         "status": "pending",
         "shortId": short_id,
@@ -457,42 +417,40 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
         # Multi-responder fields (new)
         "assignedResponderUids":  [r["uid"] for r in responders],
         "assignedResponderNames": [r.get("name") or "" for r in responders],
-        "assignedResponderPhones": [r["phone"] for r in responders],
 
         # Legacy single-responder mirror (first in list)
         "assignedResponderUid":   first["uid"],
         "assignedResponderName":  first.get("name") or "",
-        "assignedResponderPhone": first["phone"],
 
         "verifiedAt": now,
         "dispatchedAt": now,
-        "smsSent": any_ok,
-        "smsSentAt": now if any_ok else None,
-        "smsProvider": sms_results[0]["result"].get("provider"),
-        "smsMessageId": sms_results[0]["result"].get("messageId"),
-        "smsError": None if any_ok else sms_results[0]["result"].get("error"),
-        "smsRecipientCount": len(responders),
-        "smsSuccessCount": ok_count,
         "updatedAt": now,
     })
 
-    # ---- Per-responder notification log ----
-    try:
-        for sr in sms_results:
+    # ---- Send Web Push Notifications ----
+    push_success_count = 0
+    for r in responders:
+        success = send_push_to_responder(
+            responder_id=r["uid"],
+            title="New Incident Assigned",
+            body=f"Incident {short_id} in {barangay_name}. Tap to view.",
+            data={"url": f"/incident/{req.incident_id}"},
+        )
+        if success:
+            push_success_count += 1
+
+        # Log individual push attempts
+        try:
             db.collection("notifications").add({
                 "incidentId": req.incident_id,
-                "responderUid": sr["responder"]["uid"],
-                "responderPhone": sr["responder"]["phone"],
-                "responderName": sr["responder"].get("name") or "",
-                "channel": "sms",
-                "provider": sr["result"].get("provider"),
-                "message": sms_body,
-                "ok": sr["result"].get("ok", False),
-                "error": sr["result"].get("error"),
+                "responderUid": r["uid"],
+                "responderName": r.get("name") or "",
+                "channel": "push",
+                "ok": success,
                 "createdAt": now,
             })
-    except Exception as e:
-        print(f"[dispatch] notification log failed: {e}")
+        except Exception as e:
+            print(f"[dispatch] notification log failed: {e}")
 
     try:
         from analytics_service import clear_cache
@@ -501,12 +459,12 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
         pass
 
     log_event(
-        level="success" if any_ok else "warn",
+        level="success" if push_success_count > 0 else "warn",
         category="dispatch",
         action="incident.dispatched",
         message=(
-            f"Incident {short_id} dispatched to {len(responders)} responder(s) "
-            f"in {barangay_name} ({ok_count} SMS sent)"
+            f"Incident {short_id} pushed to {push_success_count}/{len(responders)} responder(s) "
+            f"in {barangay_name}"
         ),
         actor={"uid": "system", "role": "system"},
         target={"type": "incident", "id": req.incident_id},
@@ -514,8 +472,7 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
             "barangay": barangay_name,
             "responder_count": len(responders),
             "responder_uids": [r["uid"] for r in responders],
-            "sms_ok_count": ok_count,
-            "sms_any_ok": any_ok,
+            "push_ok_count": push_success_count,
         },
     )
 
@@ -525,17 +482,9 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
         status="dispatched",
         assigned_responder_uid=first["uid"],
         assigned_responder_name=first.get("name") or "",
-        assigned_responder_phone=first["phone"],
-        sms_ok=any_ok,
-        sms_provider=sms_results[0]["result"].get("provider"),
-        sms_message_id=sms_results[0]["result"].get("messageId"),
-        sms_error=None if any_ok else sms_results[0]["result"].get("error"),
-        message=(
-            f"Dispatched. SMS sent to {ok_count}/{len(responders)} responders."
-            if any_ok
-            else "Dispatched, but SMS failed for all responders."
-        ),
+        message=f"Dispatched. Push sent to {push_success_count}/{len(responders)} responders.",
     )
+
 
 # ---------------------------------------------------------------------------
 # Resolve incident
@@ -771,14 +720,13 @@ async def emergency(req: EmergencyRequest) -> EmergencyResponse:
         short_id=short_id,
         barangay=barangay_name,
         responder_assigned=False,
-        sms_sent=False,
         has_audio=bool(req.audio_url),
         message="Emergency received. Admin is reviewing and will dispatch shortly.",
     )
 
 
 # ---------------------------------------------------------------------------
-# Acknowledgement
+# Acknowledgement (App Only)
 # ---------------------------------------------------------------------------
 
 def _acknowledge_incident(
@@ -810,7 +758,6 @@ def _acknowledge_incident(
 
     dispatched_at = (
         _to_dt(data.get("dispatchedAt"))
-        or _to_dt(data.get("smsSentAt"))
         or _to_dt(data.get("verifiedAt"))
     )
     response_seconds = None
@@ -862,116 +809,6 @@ def _acknowledge_incident(
     }
 
 
-@app.get("/ack/{short_id}", response_class=HTMLResponse)
-async def acknowledge_via_link(short_id: str) -> HTMLResponse:
-    from firebase_admin import firestore
-
-    short = (short_id or "").strip().upper()
-
-    if not short:
-        return HTMLResponse(
-            _ack_page("Invalid link", "This acknowledgement link is malformed.", ok=False),
-            status_code=400,
-        )
-
-    db = firestore.client()
-    matches = list(
-        db.collection("incidents")
-        .where("shortId", "==", short)
-        .limit(1)
-        .stream()
-    )
-
-    if not matches:
-        return HTMLResponse(
-            _ack_page(
-                "Incident not found",
-                f"No incident matches reference <strong>{short}</strong>.",
-                ok=False,
-            ),
-            status_code=404,
-        )
-
-    incident_id = matches[0].id
-    result = _acknowledge_incident(incident_id, method="sms_link")
-
-    if not result.get("ok"):
-        return HTMLResponse(
-            _ack_page("Error", result.get("error", "Unknown error"), ok=False),
-            status_code=500,
-        )
-
-    if result.get("already"):
-        return HTMLResponse(_ack_page(
-            "Already acknowledged",
-            f"Incident <strong>{short}</strong> was already acknowledged.",
-            ok=True,
-        ))
-
-    secs = result.get("response_time_seconds")
-    detail = (
-        f"Acknowledged in {secs}s. The dispatcher has been notified."
-        if secs is not None
-        else "Acknowledged. The dispatcher has been notified."
-    )
-    return HTMLResponse(_ack_page("Acknowledged", detail, ok=True))
-
-
-def _ack_page(title: str, body: str, ok: bool) -> str:
-    accent = "#2f9e73" if ok else "#e63946"
-    icon = "✓" if ok else "!"
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>{title} — RoadRescue</title>
-  <style>
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0; min-height: 100dvh;
-      display: grid; place-items: center;
-      background: #0b1220; color: #eaf0fa;
-      font: 16px/1.5 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
-      padding: 24px;
-    }}
-    .card {{
-      max-width: 420px; width: 100%;
-      background: #121c2e; border: 1px solid #22304a;
-      border-radius: 18px; padding: 32px 24px;
-      text-align: center;
-      box-shadow: 0 20px 60px rgba(0,0,0,.5);
-    }}
-    .badge {{
-      width: 64px; height: 64px;
-      border-radius: 50%;
-      display: grid; place-items: center;
-      margin: 0 auto 20px;
-      font-size: 32px; font-weight: 800;
-      color: #fff; background: {accent};
-      box-shadow: 0 8px 24px {accent}55;
-    }}
-    h1 {{ font-size: 1.375rem; margin: 0 0 10px; letter-spacing: -0.01em; }}
-    p  {{ margin: 0; color: #93a3bd; line-height: 1.55; }}
-    strong {{ color: #eaf0fa; }}
-    .brand {{
-      margin-top: 24px; font-size: 0.75rem;
-      letter-spacing: 0.08em; text-transform: uppercase;
-      color: #64748b;
-    }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="badge" aria-hidden="true">{icon}</div>
-    <h1>{title}</h1>
-    <p>{body}</p>
-    <p class="brand">RoadRescue</p>
-  </div>
-</body>
-</html>"""
-
-
 @app.post("/acknowledge")
 async def acknowledge(req: AcknowledgeRequest) -> Dict[str, Any]:
     return _acknowledge_incident(
@@ -982,75 +819,29 @@ async def acknowledge(req: AcknowledgeRequest) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# SMS webhook
+# Web Push Subscriptions
 # ---------------------------------------------------------------------------
 
-@app.post("/sms/webhook")
-async def sms_webhook(request: Request) -> Dict[str, Any]:
-    from sms_webhook import parse_incoming, match_and_acknowledge
+class PushSubscriptionRequest(BaseModel):
+    responder_id: str
+    subscription: Dict[str, Any]
 
-    content_type = (request.headers.get("content-type") or "").lower()
-    json_data = None
-    form_data = {}
+@app.get("/api/push/vapid-public-key")
+async def get_vapid_key():
+    from push_service import get_public_key
+    return {"key": get_public_key()}
 
-    if "application/json" in content_type:
-        try:
-            json_data = await request.json()
-        except Exception:
-            json_data = None
-    elif "form" in content_type:
-        try:
-            form = await request.form()
-            form_data = dict(form)
-        except Exception:
-            form_data = {}
-    else:
-        try:
-            form = await request.form()
-            form_data = dict(form)
-        except Exception:
-            pass
-        try:
-            json_data = await request.json()
-        except Exception:
-            pass
+@app.post("/api/push/subscribe")
+async def subscribe_push(req: PushSubscriptionRequest):
+    from push_service import save_subscription
+    save_subscription(req.responder_id, req.subscription)
+    return {"ok": True}
 
-    parsed = parse_incoming(form_data, json_data)
-    from_phone = parsed["from"]
-    text = parsed["text"]
-
-    print(f"[webhook] inbound from={from_phone!r} text={text[:100]!r}")
-
-    if not from_phone or not text:
-        return {"ok": False, "error": "Missing sender or message body."}
-
-    try:
-        result = match_and_acknowledge(from_phone, text)
-    except Exception as e:
-        print(f"[webhook] ❌ match_and_acknowledge crashed: {e}")
-        return {"ok": False, "error": str(e)[:200]}
-
-    try:
-        from analytics_service import clear_cache
-        clear_cache()
-    except Exception:
-        pass
-
-    log_event(
-        level="success" if result.get("matched") else "warn",
-        category="sms",
-        action="sms.webhook_received",
-        message=result.get("message") or f"Inbound SMS from {from_phone}",
-        actor={"uid": "sms", "role": "provider"},
-        target=(
-            {"type": "incident", "id": result.get("incident_id")}
-            if result.get("incident_id")
-            else None
-        ),
-        metadata={"from": from_phone, "text": text[:200]},
-    )
-
-    return {"ok": True, **result}
+@app.delete("/api/push/subscribe/{responder_id}")
+async def unsubscribe_push(responder_id: str):
+    from push_service import delete_subscription
+    delete_subscription(responder_id)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
