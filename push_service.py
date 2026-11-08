@@ -6,17 +6,12 @@ from pywebpush import webpush, WebPushException
 from firebase_admin import firestore
 
 def _get_key_file():
-    # Read the Base64 encoded key
     b64_key = os.getenv("VAPID_PRIVATE_KEY_BASE64", "")
     if not b64_key:
         print("[PUSH ERROR] VAPID_PRIVATE_KEY_BASE64 is missing!")
         return None
-        
     try:
-        # Decode it back to the normal PEM format
         pem_content = base64.b64decode(b64_key).decode('utf-8')
-        
-        # Write to a temporary file so pywebpush can read it perfectly
         temp = tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".pem")
         temp.write(pem_content)
         temp.close()
@@ -29,17 +24,17 @@ VAPID_PRIVATE_KEY_PATH = _get_key_file()
 VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:admin@example.com")
 
 def save_subscription(responder_id: str, subscription: dict) -> None:
-    db = firestore.client()  # 👈 FIXED: Get client here
+    db = firestore.client()
     db.collection("push_subscriptions").document(responder_id).set(
         {"subscription": subscription}, merge=True
     )
 
 def delete_subscription(responder_id: str) -> None:
-    db = firestore.client()  # 👈 FIXED: Get client here
+    db = firestore.client()
     db.collection("push_subscriptions").document(responder_id).delete()
 
 def _get_subscription(responder_id: str):
-    db = firestore.client()  # 👈 FIXED: Get client here
+    db = firestore.client()
     doc = db.collection("push_subscriptions").document(responder_id).get()
     if not doc.exists:
         return None
@@ -52,16 +47,26 @@ def send_push_to_responder(responder_id: str, title: str, body: str, data: dict 
         return False
         
     if not VAPID_PRIVATE_KEY_PATH:
-        print("[PUSH ERROR] VAPID_PRIVATE_KEY_PATH is not set (File creation failed).")
+        print("[PUSH ERROR] VAPID_PRIVATE_KEY_PATH is not set.")
         return False
         
-    payload = json.dumps({"title": title, "body": body, "data": data or {}})
+    # SAFER PAYLOAD FOR IOS
+    payload_data = {
+        "title": title, 
+        "body": body, 
+        "data": data or {},
+        "tag": "incident-alert" # iOS needs a tag to group/replace notifications
+    }
+    payload = json.dumps(payload_data)
+    
     try:
         webpush(
             subscription_info=sub,
             data=payload,
             vapid_private_key=VAPID_PRIVATE_KEY_PATH, 
             vapid_claims={"sub": VAPID_SUBJECT},
+            # Force the urgency to high so iOS doesn't hold it
+            headers={"Urgency": "high"} 
         )
         return True
     except WebPushException as e:
@@ -74,6 +79,5 @@ def send_push_to_responder(responder_id: str, title: str, body: str, data: dict 
         return False
 
 def get_public_key():
-    # Ensure the public key is clean
     key = os.getenv("VAPID_PUBLIC_KEY", "")
     return key.replace("\n", "").replace(" ", "").strip()
