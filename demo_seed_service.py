@@ -43,7 +43,7 @@ TOTAL_INCIDENTS = 45
 RESOLVED_COUNT = 36
 CANCELLED_COUNT = 9
 
-SEED_VERSION = "2.1"
+SEED_VERSION = "2.2"
 
 PH_TIMEZONE = timezone(timedelta(hours=8))
 
@@ -228,15 +228,17 @@ def _validate_configuration() -> None:
 # REGISTERED RESPONDERS
 # ============================================================
 
-def _get_responders_by_barangay(
-    db,
-    barangays: List[Dict[str, Any]],
-) -> Dict[str, List[Dict[str, Any]]]:
+def _get_active_responders(db) -> List[Dict[str, Any]]:
+    """Return all registered active responders in stable UID order.
 
-    users_by_uid = {}
+    Demo incidents are distributed across the active responder pool instead
+    of relying on optional barangay profile links. This prevents demo records
+    from being created without an owner when a barangay has no responder link.
+    """
+
+    responders = []
 
     for doc in db.collection("users").stream():
-
         user = doc.to_dict() or {}
 
         if user.get("role") != "responder":
@@ -248,85 +250,26 @@ def _get_responders_by_barangay(
         if user.get("status", "active") != "active":
             continue
 
-        user["uid"] = doc.id
-        users_by_uid[doc.id] = user
+        responders.append({
+            "uid": doc.id,
+            "name": (
+                user.get("fullName")
+                or user.get("displayName")
+                or "Registered Responder"
+            ),
+        })
 
-    result = {}
+    # Stable ordering makes the round-robin assignment reproducible.
+    responders.sort(key=lambda responder: responder["uid"])
 
-    for barangay in barangays:
+    if not responders:
+        raise RuntimeError(
+            "No active responder accounts were found. "
+            "Activate/register at least one user with role='responder' "
+            "before seeding demo incidents. No demo records were written."
+        )
 
-        name = barangay["name"]
-        slug = barangay["slug"]
-
-        normalized = _normalize_name(name)
-
-        matched = {}
-
-        # Match responders through their profiles.
-        for uid, user in users_by_uid.items():
-
-            assigned = (
-                user.get("assignedBarangay")
-                or user.get("barangay")
-                or ""
-            )
-
-            if _normalize_name(str(assigned)) == normalized:
-                matched[uid] = user
-
-        # Match responders through barangay documents.
-        try:
-
-            snapshot = (
-                db.collection("barangays")
-                .document(slug)
-                .get()
-            )
-
-            if snapshot.exists:
-
-                data = snapshot.to_dict() or {}
-
-                assigned = data.get("responders", [])
-
-                if isinstance(assigned, list):
-
-                    for responder in assigned:
-
-                        if not isinstance(responder, dict):
-                            continue
-
-                        uid = responder.get("uid")
-
-                        if uid in users_by_uid:
-                            matched[uid] = users_by_uid[uid]
-
-                # Legacy schema.
-                legacy_uid = data.get("responderUid")
-
-                if legacy_uid in users_by_uid:
-                    matched[legacy_uid] = users_by_uid[legacy_uid]
-
-        except Exception as exc:
-
-            print(
-                f"[demo-seed] Responder lookup failed "
-                f"for {name}: {exc}"
-            )
-
-        result[slug] = [
-            {
-                "uid": uid,
-                "name": (
-                    user.get("fullName")
-                    or user.get("displayName")
-                    or "Registered Responder"
-                ),
-            }
-            for uid, user in matched.items()
-        ]
-
-    return result
+    return responders
 
 
 # ============================================================
@@ -341,9 +284,9 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
 
     barangays = _get_barangays()
 
-    responders_by_barangay = (
-        _get_responders_by_barangay(db, barangays)
-    )
+    # Use the complete active responder pool. Barangay profile links are
+    # optional and must not cause a demo incident to remain unassigned.
+    active_responders = _get_active_responders(db)
 
     # Generate exact emergency category distribution.
     incident_types = []
@@ -422,18 +365,10 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             -0.0015, 0.0015
         )
 
-        # Find existing responder assigned to barangay.
-        assigned_responders = responders_by_barangay.get(
-            barangay["slug"],
-            [],
-        )
-
-        responder = None
-
-        if assigned_responders:
-            responder = assigned_responders[
-                (index - 1) % len(assigned_responders)
-            ]
+        # Distribute demo incidents evenly across all active responders.
+        responder = active_responders[
+            (index - 1) % len(active_responders)
+        ]
 
         priority = _get_priority(incident_type)
 
@@ -515,18 +450,17 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             "demoSeedVersion": SEED_VERSION,
         }
 
-        if responder:
-
-            incident.update({
-                "assignedResponderUid": responder["uid"],
-                "assignedResponderName": responder["name"],
-                "assignedResponderUids": [
-                    responder["uid"]
-                ],
-                "assignedResponderNames": [
-                    responder["name"]
-                ],
-            })
+        # Keep both field conventions in sync:
+        # responder history queries responderUid, while other parts of the
+        # application use assignedResponderUid / assignedResponderUids.
+        incident.update({
+            "responderUid": responder["uid"],
+            "responderName": responder["name"],
+            "assignedResponderUid": responder["uid"],
+            "assignedResponderName": responder["name"],
+            "assignedResponderUids": [responder["uid"]],
+            "assignedResponderNames": [responder["name"]],
+        })
 
         if status == "resolved":
 
@@ -762,16 +696,7 @@ def preview_demo_dataset(
                 else:
                     log_collisions += 1
 
-    responders = _get_responders_by_barangay(
-        db,
-        _get_barangays(),
-    )
-
-    responder_count = len({
-        responder["uid"]
-        for values in responders.values()
-        for responder in values
-    })
+    responder_count = len(_get_active_responders(db))
 
     return {
         "ok": True,
@@ -830,6 +755,7 @@ def seed_demo_dataset(
     skipped_logs = 0
 
     created_incidents = 0
+    updated_incident_assignments = 0
     created_logs = 0
 
     # --------------------------------------------------------
@@ -861,10 +787,26 @@ def seed_demo_dataset(
 
             skipped_incidents += 1
 
+            # Repair only responder assignment fields on existing records
+            # owned by this exact demo batch. All other incident data stays
+            # untouched (status, timestamps, description, location, etc.).
+            incident_data = item["data"]
+            assignment_patch = {
+                "responderUid": incident_data["responderUid"],
+                "responderName": incident_data["responderName"],
+                "assignedResponderUid": incident_data["assignedResponderUid"],
+                "assignedResponderName": incident_data["assignedResponderName"],
+                "assignedResponderUids": incident_data["assignedResponderUids"],
+                "assignedResponderNames": incident_data["assignedResponderNames"],
+            }
+            pending_writes.append(
+                (incident_ref, assignment_patch, "incident_assignment_update")
+            )
+
         else:
 
             pending_writes.append(
-                (incident_ref, item["data"], "incident")
+                (incident_ref, item["data"], "incident_create")
             )
 
         logs = _build_logs(
@@ -897,7 +839,7 @@ def seed_demo_dataset(
             else:
 
                 pending_writes.append(
-                    (log_ref, log["data"], "log")
+                    (log_ref, log["data"], "log_create")
                 )
 
     # --------------------------------------------------------
@@ -918,12 +860,19 @@ def seed_demo_dataset(
 
         for ref, data, record_type in chunk:
 
-            # create() prevents overwriting existing documents.
-            batch.create(ref, data)
-
-            if record_type == "incident":
+            if record_type == "incident_create":
+                # create() prevents overwriting existing documents.
+                batch.create(ref, data)
                 created_incidents += 1
-            else:
+
+            elif record_type == "incident_assignment_update":
+                # Update only assignment fields on an already-verified
+                # document from this exact synthetic demo batch.
+                batch.update(ref, data)
+                updated_incident_assignments += 1
+
+            elif record_type == "log_create":
+                batch.create(ref, data)
                 created_logs += 1
 
         # Firestore commits each chunk atomically.
@@ -943,6 +892,8 @@ def seed_demo_dataset(
         "incidentsCreated": created_incidents,
 
         "incidentsAlreadyExisting": skipped_incidents,
+
+        "incidentAssignmentsUpdated": updated_incident_assignments,
 
         "logsCreated": created_logs,
 
