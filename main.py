@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -94,12 +94,70 @@ app.add_middleware(
 )
 
 # Register admin user management router
-from admin_users import router as admin_users_router, me_router
+from admin_users import (
+    router as admin_users_router,
+    me_router,
+    require_admin,
+)
 app.include_router(admin_users_router)
 app.include_router(me_router)
 
 # Logging service
 from log_service import log_event, log_from_request
+
+
+# ---------------------------------------------------------------------------
+# ADMIN — Synthetic Demo Data
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/demo-seed/preview")
+async def preview_demo_seed(
+    admin: Dict[str, Any] = Depends(require_admin),
+):
+    from firebase_admin import firestore
+    from demo_seed_service import preview_demo_dataset
+
+    try:
+        return preview_demo_dataset(firestore.client(), admin)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Demo preview failed: {str(e)[:250]}",
+        )
+
+
+@app.post("/admin/demo-seed")
+async def create_demo_seed(
+    admin: Dict[str, Any] = Depends(require_admin),
+):
+    from firebase_admin import firestore
+    from demo_seed_service import seed_demo_dataset
+
+    try:
+        return seed_demo_dataset(firestore.client(), admin)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Demo seeding failed: {str(e)[:250]}",
+        )
+
+
+@app.delete("/admin/demo-seed")
+async def remove_demo_seed(
+    admin: Dict[str, Any] = Depends(require_admin),
+):
+    from firebase_admin import firestore
+    from demo_seed_service import delete_demo_dataset
+
+    try:
+        return delete_demo_dataset(firestore.client(), admin)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Demo cleanup failed: {str(e)[:250]}",
+        )
 
 
 # ---------------------------------------------------------------------------
