@@ -9,18 +9,8 @@ Creates:
 - Realistic roadside assistance descriptions
 - Corresponding system_logs entries
 
-Emergency categories:
-- Flat Tire
-- Dead Battery
-- Out of Fuel
-- Stalled
-- Minor Crash
-- Major Crash
-- Vehicle Fire
-- Road Hazard
-
 Safety:
-- Uses a dedicated demo batch ID.
+- Uses a dedicated deterministic demo batch ID.
 - Does not send SMS or push notifications.
 - Does not impersonate actual responders in activity logs.
 - Uses existing active responder accounts for assignment fields.
@@ -57,8 +47,6 @@ PH_TIMEZONE = timezone(timedelta(hours=8))
 # ============================================================
 # EMERGENCY CATEGORIES
 # ============================================================
-
-# Distribution totals exactly 45 records.
 
 INCIDENT_DISTRIBUTION = {
     "Flat Tire": 8,
@@ -214,7 +202,6 @@ def _get_responders_by_barangay(
 
         # Match responders through their profiles.
         for uid, user in users_by_uid.items():
-
             assigned = (
                 user.get("assignedBarangay")
                 or user.get("barangay")
@@ -239,7 +226,6 @@ def _get_responders_by_barangay(
 
                 if isinstance(assigned, list):
                     for responder in assigned:
-
                         if not isinstance(responder, dict):
                             continue
 
@@ -341,10 +327,9 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
         ]
 
         incident_type = incident_types[index - 1]
-
         status = statuses[index - 1]
 
-        # Generate realistic reporting times.
+        # Generate reporting times in Philippine time.
         day_offset = rng.randint(0, total_days - 1)
 
         local_created = (
@@ -373,9 +358,7 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             seconds=response_seconds
         )
 
-        responded_duration = rng.randint(
-            600, 5400
-        )
+        responded_duration = rng.randint(600, 5400)
 
         resolved_at = accepted_at + timedelta(
             seconds=responded_duration
@@ -411,9 +394,7 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
 
         incident_id = _incident_id(index)
 
-        # Each demonstration reporter is fictional.
         incident = {
-
             "shortId": f"DEMO{index:03d}",
 
             "type": incident_type,
@@ -483,7 +464,7 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
                 "processedAt": created_at,
             },
 
-            # Internal identification.
+            # Internal identification fields.
             "isSynthetic": True,
             "demoBatchId": BATCH_ID,
             "demoSeedVersion": SEED_VERSION,
@@ -498,7 +479,6 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             })
 
         if status == "resolved":
-
             incident.update({
                 "acknowledgedAt": accepted_at,
                 "acknowledgedVia": "demo_simulation",
@@ -509,7 +489,6 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             })
 
         else:
-
             incident.update({
                 "cancelledAt": cancelled_at,
                 "cancelReason": (
@@ -583,16 +562,18 @@ def _build_logs(
                 "target": target,
                 "metadata": metadata,
                 "userAgent": "RoadRescue Demonstration",
+
+                # Top-level ownership fields for safe cleanup.
+                "isSynthetic": True,
                 "demoBatchId": BATCH_ID,
+                "demoSeedVersion": SEED_VERSION,
             },
         })
 
     short_id = incident["shortId"]
 
     created_at = incident["createdAt"]
-
     verified_at = incident["verifiedAt"]
-
     dispatched_at = incident["dispatchedAt"]
 
     # Incident received.
@@ -668,7 +649,7 @@ def _build_logs(
 
 
 # ============================================================
-# PREVIEW
+# PREVIEW DATASET
 # ============================================================
 
 def preview_demo_dataset(
@@ -694,7 +675,6 @@ def preview_demo_dataset(
         snap = incident_ref.get()
 
         if snap.exists:
-
             data = snap.to_dict() or {}
 
             if data.get("demoBatchId") == BATCH_ID:
@@ -718,7 +698,6 @@ def preview_demo_dataset(
             log_snap = log_ref.get()
 
             if log_snap.exists:
-
                 log_data = log_snap.to_dict() or {}
 
                 if log_data.get("demoBatchId") == BATCH_ID:
@@ -794,10 +773,8 @@ def seed_demo_dataset(
     created_logs = 0
     skipped_logs = 0
 
-    # --------------------------------------------------------
     # FIRST PASS: CHECK ALL DOCUMENT COLLISIONS.
     # No writes are performed until all checks pass.
-    # --------------------------------------------------------
 
     for item in dataset:
 
@@ -808,7 +785,6 @@ def seed_demo_dataset(
         )
 
         if snap.exists:
-
             data = snap.to_dict() or {}
 
             if data.get("demoBatchId") != BATCH_ID:
@@ -830,7 +806,6 @@ def seed_demo_dataset(
             )
 
             if log_snap.exists:
-
                 log_data = log_snap.to_dict() or {}
 
                 if log_data.get("demoBatchId") != BATCH_ID:
@@ -839,10 +814,8 @@ def seed_demo_dataset(
                         "No data was seeded."
                     )
 
-    # --------------------------------------------------------
     # SECOND PASS: CREATE INCIDENTS AND LOGS.
     # Existing documents from this batch are skipped.
-    # --------------------------------------------------------
 
     for item in dataset:
 
@@ -854,11 +827,8 @@ def seed_demo_dataset(
         existing = incident_ref.get()
 
         if existing.exists:
-
             skipped_incidents += 1
-
         else:
-
             incident_ref.create(item["data"])
             created_incidents += 1
 
@@ -876,11 +846,8 @@ def seed_demo_dataset(
             )
 
             if log_ref.get().exists:
-
                 skipped_logs += 1
-
             else:
-
                 log_ref.create(log["data"])
                 created_logs += 1
 
@@ -947,7 +914,6 @@ def delete_demo_dataset(
                 data.get("isSynthetic") is True
                 and data.get("demoBatchId") == BATCH_ID
             ):
-
                 incident_ref.delete()
                 deleted_incidents += 1
 
@@ -970,11 +936,10 @@ def delete_demo_dataset(
 
                 log_data = log_snap.to_dict() or {}
 
-                if (
-                    log_data.get("isSynthetic") is True
-                    and log_data.get("demoBatchId") == BATCH_ID
-                ):
-
+                # FIX:
+                # Older logs stored isSynthetic only inside metadata.
+                # The unique batch ID is the ownership check.
+                if log_data.get("demoBatchId") == BATCH_ID:
                     log_ref.delete()
                     deleted_logs += 1
 
