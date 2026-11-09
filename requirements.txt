@@ -14,3 +14,5 @@ numpy>=2.0,<3.0
 email-validator>=2.0,<3.0
 pywebpush==2.0.3
 py-vapid==1.9.1
+
+psgc[geo]
