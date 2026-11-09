@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +408,7 @@ async def dispatch_incident(req: DispatchRequest) -> DispatchResponse:
     short_id = req.incident_id[:6].upper()
 
     first = responders[0]
-    
+
     # ---- Persist dispatch state to Firestore ----
     incident_ref.update({
         "status": "pending",
@@ -563,7 +563,20 @@ async def resolve_incident(req: ResolveRequest) -> Dict[str, Any]:
 # Anonymous emergency
 # ---------------------------------------------------------------------------
 
-def _nearest_barangay(lat: float, lng: float) -> Optional[Dict[str, Any]]:
+def _normalize_name(name: str) -> str:
+    """Strip suffixes like '(Poblacion)', lowercase, collapse non-alphanumerics."""
+    s = name.lower()
+    s = re.sub(r"\(.*?\)", "", s)          # drop "(Poblacion)" and similar
+    s = re.sub(r"[^a-z0-9]+", " ", s)      # punctuation -> space
+    return " ".join(s.split())             # collapse whitespace
+
+
+def _determine_barangay(lat: float, lng: float) -> Optional[Dict[str, Any]]:
+    """
+    Point-in-polygon lookup via psgc, then map back to the local
+    data/barangays.py entry so dispatch slugs continue to match.
+    Falls back to the old nearest-center logic only if psgc fails.
+    """
     try:
         from data.barangays import to_documents
     except Exception as e:
@@ -574,6 +587,24 @@ def _nearest_barangay(lat: float, lng: float) -> Optional[Dict[str, Any]]:
     if not docs:
         return None
 
+    # --- 1. Try official boundary lookup ---
+    try:
+        import psgc
+        result = psgc.reverse_geocode(lat, lng)
+        if result and getattr(result, "barangay", None):
+            target = _normalize_name(result.barangay)
+            for d in docs:
+                if _normalize_name(d["name"]) == target:
+                    return d
+            # psgc returned a name that doesn't match any local doc
+            print(
+                f"[emergency] psgc returned '{result.barangay}' "
+                f"but no matching local barangay; falling back"
+            )
+    except Exception as e:
+        print(f"[emergency] psgc reverse_geocode failed: {e}")
+
+    # --- 2. Safety fallback: old nearest-center logic ---
     def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
         R = 6371000.0
         to_rad = math.radians
@@ -632,7 +663,7 @@ async def emergency(req: EmergencyRequest) -> EmergencyResponse:
         except Exception as e:
             print(f"[emergency] rate-limit check skipped: {e}")
 
-    b = _nearest_barangay(req.lat, req.lng)
+    b = _determine_barangay(req.lat, req.lng)
     if not b:
         return EmergencyResponse(
             ok=False,
