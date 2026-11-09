@@ -1,17 +1,31 @@
+
 """
-RoadRescue synthetic demo data seeder.
+RoadRescue realistic incident demonstration seeder.
 
 Creates:
-- 45 synthetic incidents
+- 45 fictional demonstration incidents
 - 36 resolved incidents
 - 9 cancelled incidents
-- Corresponding synthetic system_logs entries
+- Realistic roadside assistance descriptions
+- Corresponding system_logs entries
+
+Emergency categories:
+- Flat Tire
+- Dead Battery
+- Out of Fuel
+- Stalled
+- Minor Crash
+- Major Crash
+- Vehicle Fire
+- Road Hazard
 
 Safety:
-- Uses a dedicated deterministic demo batch ID.
-- Does not send push notifications or SMS.
-- Does not impersonate responders in activity logs.
-- Deletes only documents belonging to this exact demo batch.
+- Uses a dedicated demo batch ID.
+- Does not send SMS or push notifications.
+- Does not impersonate actual responders in activity logs.
+- Uses existing active responder accounts for assignment fields.
+- Preserves internal demo identification fields.
+- Deletes only records belonging to this exact demo batch.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -35,19 +49,95 @@ TOTAL_INCIDENTS = 45
 RESOLVED_COUNT = 36
 CANCELLED_COUNT = 9
 
-SEED_VERSION = "1.0"
+SEED_VERSION = "2.0"
+
+PH_TIMEZONE = timezone(timedelta(hours=8))
+
+
+# ============================================================
+# EMERGENCY CATEGORIES
+# ============================================================
+
+# Distribution totals exactly 45 records.
+
+INCIDENT_DISTRIBUTION = {
+    "Flat Tire": 8,
+    "Dead Battery": 7,
+    "Out of Fuel": 6,
+    "Stalled": 6,
+    "Minor Crash": 7,
+    "Major Crash": 3,
+    "Vehicle Fire": 2,
+    "Road Hazard": 6,
+}
+
+
+# ============================================================
+# INCIDENT DESCRIPTIONS
+# ============================================================
+
+DESCRIPTIONS = {
+    "Flat Tire": [
+        "The vehicle sustained a flat front tire while traveling along the road. The driver is requesting roadside assistance.",
+        "A motorist reported a punctured rear tire and is unable to continue the journey safely.",
+        "The driver noticed a sudden loss of tire pressure and pulled over near the roadside.",
+        "A vehicle is stranded after experiencing a flat tire. Assistance is requested for tire replacement.",
+    ],
+
+    "Dead Battery": [
+        "The vehicle will not start due to a suspected drained battery. The driver is requesting jump-start assistance.",
+        "A motorist reported that the engine would not start after the vehicle was parked for an extended period.",
+        "The vehicle's battery appears to have lost power, leaving the driver stranded.",
+        "The driver requested assistance after experiencing repeated starting problems.",
+    ],
+
+    "Out of Fuel": [
+        "The vehicle ran out of fuel while traveling and is currently stopped along the roadside.",
+        "A motorist reported being stranded after the fuel supply was depleted.",
+        "The driver is requesting fuel assistance after the vehicle stopped due to an empty fuel tank.",
+        "A vehicle is parked along the roadside after running out of gasoline.",
+    ],
+
+    "Stalled": [
+        "The vehicle's engine suddenly stopped while traveling. The driver was able to move to the roadside.",
+        "A motorist reported engine trouble that caused the vehicle to stall unexpectedly.",
+        "The vehicle is unable to restart after stalling along the roadway.",
+        "The driver requested assistance after experiencing mechanical problems during travel.",
+    ],
+
+    "Minor Crash": [
+        "A minor collision involving two vehicles was reported. The drivers are requesting assistance and incident assessment.",
+        "A vehicle sustained minor damage following a low-speed collision near an intersection.",
+        "A motorist reported a minor road accident involving another vehicle. Traffic is partially affected.",
+        "A minor vehicle collision was reported. Initial reports indicate no obvious serious injuries.",
+    ],
+
+    "Major Crash": [
+        "A serious collision involving multiple vehicles was reported. Immediate assessment and emergency assistance are requested.",
+        "A major road accident was reported along the main roadway. Possible injuries have been reported.",
+        "A vehicle sustained significant damage following a collision. Medical and emergency response assistance is requested.",
+        "A serious traffic accident was reported, causing partial obstruction of the roadway.",
+    ],
+
+    "Vehicle Fire": [
+        "Smoke was observed coming from the vehicle's engine compartment. The driver immediately stopped and requested assistance.",
+        "A motorist reported flames coming from a vehicle parked along the roadside.",
+        "A vehicle fire was reported after the driver noticed smoke and unusual heat coming from the engine.",
+        "A burning smell followed by visible smoke was reported from a vehicle. Immediate assistance is requested.",
+    ],
+
+    "Road Hazard": [
+        "A fallen tree branch is obstructing part of the roadway and creating a hazard for passing vehicles.",
+        "A large object was reported blocking one lane of the road.",
+        "A damaged portion of the roadway was reported, creating difficulty for passing motorists.",
+        "Debris scattered along the road is posing a potential danger to passing vehicles.",
+    ],
+}
 
 
 # ============================================================
 # HELPERS
 # ============================================================
-
-def _slugify(value: str) -> str:
-    value = value.lower()
-    value = re.sub(r"[()]", "", value)
-    value = re.sub(r"[^a-z0-9]+", "-", value)
-    return value.strip("-")
-
 
 def _normalize_name(value: str) -> str:
     value = re.sub(r"\(.*?\)", "", value.lower())
@@ -55,19 +145,15 @@ def _normalize_name(value: str) -> str:
     return " ".join(value.split())
 
 
-def _utc(value: datetime) -> datetime:
-    """Convert a datetime to UTC."""
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-
 def _incident_id(index: int) -> str:
     return f"demo_oct23_nov09_2026_{index:03d}"
 
 
 def _log_id(index: int, action: str) -> str:
-    return f"demo_oct23_nov09_2026_{index:03d}_{action}"
+    return (
+        f"demo_oct23_nov09_2026_"
+        f"{index:03d}_{action.replace('.', '_')}"
+    )
 
 
 def _clear_analytics_cache() -> None:
@@ -78,17 +164,15 @@ def _clear_analytics_cache() -> None:
         print(f"[demo-seed] Analytics cache clear skipped: {exc}")
 
 
-# ============================================================
-# BARANGAYS
-# ============================================================
-
 def _get_barangays() -> List[Dict[str, Any]]:
     from data.barangays import to_documents
 
     barangays = to_documents()
 
     if not barangays:
-        raise RuntimeError("No barangays found in data/barangays.py")
+        raise RuntimeError(
+            "No barangays found in data/barangays.py"
+        )
 
     return barangays
 
@@ -101,15 +185,6 @@ def _get_responders_by_barangay(
     db,
     barangays: List[Dict[str, Any]],
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Only uses existing, registered, active responder accounts.
-
-    Supports:
-    - users.barangay
-    - users.assignedBarangay
-    - barangays.responders
-    - barangays.responderUid (legacy schema)
-    """
 
     users_by_uid: Dict[str, Dict[str, Any]] = {}
 
@@ -128,17 +203,18 @@ def _get_responders_by_barangay(
         user["uid"] = doc.id
         users_by_uid[doc.id] = user
 
-    result: Dict[str, List[Dict[str, Any]]] = {}
+    result = {}
 
     for barangay in barangays:
         name = barangay["name"]
         slug = barangay["slug"]
         normalized = _normalize_name(name)
 
-        matched: Dict[str, Dict[str, Any]] = {}
+        matched = {}
 
-        # Match responders using their user profile.
+        # Match responders through their profiles.
         for uid, user in users_by_uid.items():
+
             assigned = (
                 user.get("assignedBarangay")
                 or user.get("barangay")
@@ -148,21 +224,22 @@ def _get_responders_by_barangay(
             if _normalize_name(str(assigned)) == normalized:
                 matched[uid] = user
 
-        # Also inspect the barangay document's responder assignments.
+        # Match responders through barangay documents.
         try:
-            b_snap = (
+            snapshot = (
                 db.collection("barangays")
                 .document(slug)
                 .get()
             )
 
-            if b_snap.exists:
-                b_data = b_snap.to_dict() or {}
+            if snapshot.exists:
+                data = snapshot.to_dict() or {}
 
-                assigned_responders = b_data.get("responders", [])
+                assigned = data.get("responders", [])
 
-                if isinstance(assigned_responders, list):
-                    for responder in assigned_responders:
+                if isinstance(assigned, list):
+                    for responder in assigned:
+
                         if not isinstance(responder, dict):
                             continue
 
@@ -171,124 +248,123 @@ def _get_responders_by_barangay(
                         if uid in users_by_uid:
                             matched[uid] = users_by_uid[uid]
 
-                # Legacy single-responder schema.
-                legacy_uid = b_data.get("responderUid")
+                # Legacy schema.
+                legacy_uid = data.get("responderUid")
 
                 if legacy_uid in users_by_uid:
                     matched[legacy_uid] = users_by_uid[legacy_uid]
 
         except Exception as exc:
             print(
-                f"[demo-seed] Could not read responder assignment "
+                f"[demo-seed] Responder lookup failed "
                 f"for {name}: {exc}"
             )
 
-        responders = []
-
-        for uid, user in matched.items():
-            responders.append({
+        result[slug] = [
+            {
                 "uid": uid,
                 "name": (
                     user.get("fullName")
                     or user.get("displayName")
                     or "Registered Responder"
                 ),
-            })
-
-        result[slug] = responders
+            }
+            for uid, user in matched.items()
+        ]
 
     return result
 
 
 # ============================================================
-# SYNTHETIC DATA GENERATION
+# PRIORITY ASSIGNMENT
+# ============================================================
+
+def _get_priority(incident_type: str) -> str:
+
+    priorities = {
+        "Flat Tire": "low",
+        "Dead Battery": "low",
+        "Out of Fuel": "low",
+        "Stalled": "medium",
+        "Minor Crash": "medium",
+        "Major Crash": "critical",
+        "Vehicle Fire": "critical",
+        "Road Hazard": "medium",
+    }
+
+    return priorities.get(incident_type, "medium")
+
+
+# ============================================================
+# BUILD INCIDENT DATASET
 # ============================================================
 
 def _build_dataset(db) -> List[Dict[str, Any]]:
+
     rng = Random(20261109)
 
     barangays = _get_barangays()
-    responders_by_barangay = _get_responders_by_barangay(
-        db,
-        barangays,
+
+    responders_by_barangay = (
+        _get_responders_by_barangay(db, barangays)
     )
 
-    incident_types = [
-        "accident",
-        "medical",
-        "fire",
-        "road_hazard",
-        "emergency",
-    ]
+    # Generate the exact emergency category distribution.
+    incident_types = []
 
-    descriptions = {
-        "accident": [
-            "SYNTHETIC DEMO: Simulated road accident requiring assistance.",
-            "SYNTHETIC DEMO: Simulated vehicle collision report.",
-            "SYNTHETIC DEMO: Simulated traffic accident for dashboard testing.",
-        ],
-        "medical": [
-            "SYNTHETIC DEMO: Simulated medical emergency.",
-            "SYNTHETIC DEMO: Simulated request for medical assistance.",
-            "SYNTHETIC DEMO: Simulated patient assistance report.",
-        ],
-        "fire": [
-            "SYNTHETIC DEMO: Simulated fire incident report.",
-            "SYNTHETIC DEMO: Simulated smoke and fire assistance request.",
-            "SYNTHETIC DEMO: Simulated fire response scenario.",
-        ],
-        "road_hazard": [
-            "SYNTHETIC DEMO: Simulated road obstruction.",
-            "SYNTHETIC DEMO: Simulated hazardous road condition.",
-            "SYNTHETIC DEMO: Simulated traffic hazard report.",
-        ],
-        "emergency": [
-            "SYNTHETIC DEMO: Simulated emergency assistance request.",
-            "SYNTHETIC DEMO: Simulated urgent incident report.",
-            "SYNTHETIC DEMO: Simulated emergency response scenario.",
-        ],
-    }
+    for category, count in INCIDENT_DISTRIBUTION.items():
+        incident_types.extend([category] * count)
+
+    if len(incident_types) != TOTAL_INCIDENTS:
+        raise RuntimeError(
+            "Emergency category distribution must total 45."
+        )
+
+    rng.shuffle(incident_types)
+
+    # Generate 36 resolved and 9 cancelled records.
+    statuses = (
+        ["resolved"] * RESOLVED_COUNT
+        + ["cancelled"] * CANCELLED_COUNT
+    )
+
+    rng.shuffle(statuses)
 
     total_days = (END_DATE - START_DATE).days + 1
 
     dataset = []
 
     for index in range(1, TOTAL_INCIDENTS + 1):
-        barangay = barangays[(index - 1) % len(barangays)]
 
-        incident_type = incident_types[
-            (index - 1) % len(incident_types)
+        barangay = barangays[
+            (index - 1) % len(barangays)
         ]
 
-        is_resolved = index <= RESOLVED_COUNT
+        incident_type = incident_types[index - 1]
 
-        status = "resolved" if is_resolved else "cancelled"
+        status = statuses[index - 1]
 
-        # Spread records across October 23 through November 9.
-        day_offset = (index * 7 + index // 3) % total_days
+        # Generate realistic reporting times.
+        day_offset = rng.randint(0, total_days - 1)
 
         local_created = (
-            START_DATE
-            + timedelta(days=day_offset)
+            START_DATE + timedelta(days=day_offset)
         ).replace(
-            hour=rng.randint(7, 20),
+            hour=rng.randint(6, 22),
             minute=rng.randint(0, 59),
-            second=0,
+            second=rng.randint(0, 59),
         )
 
-        # The synthetic schedule is based on Philippine local time.
-        local_created = local_created.replace(
-            tzinfo=timezone(timedelta(hours=8))
-        )
-
-        created_at = local_created.astimezone(timezone.utc)
+        created_at = local_created.replace(
+            tzinfo=PH_TIMEZONE
+        ).astimezone(timezone.utc)
 
         verified_at = created_at + timedelta(
-            minutes=rng.randint(2, 10)
+            minutes=rng.randint(2, 12)
         )
 
         dispatched_at = verified_at + timedelta(
-            minutes=rng.randint(1, 5)
+            minutes=rng.randint(1, 8)
         )
 
         response_seconds = rng.randint(120, 900)
@@ -297,7 +373,9 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             seconds=response_seconds
         )
 
-        responded_duration = rng.randint(600, 5400)
+        responded_duration = rng.randint(
+            600, 5400
+        )
 
         resolved_at = accepted_at + timedelta(
             seconds=responded_duration
@@ -307,6 +385,7 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             minutes=rng.randint(5, 30)
         )
 
+        # Barangay coordinates with small location variation.
         lat = float(barangay["lat"]) + rng.uniform(
             -0.0015, 0.0015
         )
@@ -315,6 +394,7 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             -0.0015, 0.0015
         )
 
+        # Find an existing responder assigned to the barangay.
         assigned_responders = responders_by_barangay.get(
             barangay["slug"],
             [],
@@ -327,51 +407,61 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
                 (index - 1) % len(assigned_responders)
             ]
 
-        priority = (
-            "critical"
-            if incident_type in ("emergency", "fire")
-            else "high"
-            if incident_type in ("accident", "medical")
-            else "medium"
-        )
+        priority = _get_priority(incident_type)
 
         incident_id = _incident_id(index)
 
-        incident: Dict[str, Any] = {
+        # Each demonstration reporter is fictional.
+        incident = {
+
             "shortId": f"DEMO{index:03d}",
 
             "type": incident_type,
 
             "description": rng.choice(
-                descriptions[incident_type]
+                DESCRIPTIONS[incident_type]
             ),
 
             "barangay": barangay["name"],
+
             "suggestedBarangay": barangay["name"],
 
             "location": firestore.GeoPoint(lat, lng),
 
-            "citizenName": "Synthetic Demo Reporter",
+            "citizenName": f"Demo Citizen {index:03d}",
+
             "citizenPhone": "",
+
             "citizenUid": None,
 
-            "anonymous": True,
-            "deviceId": f"demo-device-{index:03d}",
+            "anonymous": False,
+
+            "deviceId": (
+                f"roadrescue-demo-device-{index:03d}"
+            ),
 
             "status": status,
+
             "priority": priority,
 
             "createdAt": created_at,
+
             "updatedAt": (
-                resolved_at if is_resolved else cancelled_at
+                resolved_at
+                if status == "resolved"
+                else cancelled_at
             ),
 
             "verifiedAt": verified_at,
+
             "dispatchedAt": dispatched_at,
 
             "photoUrls": [],
+
             "videoUrl": None,
+
             "audioUrl": None,
+
             "audioDurationSeconds": None,
 
             "ml": {
@@ -380,17 +470,20 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
                 "confidence": round(
                     rng.uniform(0.85, 0.99), 2
                 ),
-                "keywords": ["synthetic", "demo"],
+                "keywords": [
+                    incident_type.lower(),
+                    "roadside assistance",
+                ],
                 "mentionedVehicles": [],
                 "vehicles": {},
                 "allVehicles": [],
-                "sources": ["synthetic_demo_seed"],
+                "sources": ["demo_incident"],
                 "reportedType": incident_type,
                 "reportedTypeMatches": True,
                 "processedAt": created_at,
             },
 
-            # Synthetic-data identification.
+            # Internal identification.
             "isSynthetic": True,
             "demoBatchId": BATCH_ID,
             "demoSeedVersion": SEED_VERSION,
@@ -404,7 +497,8 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
                 "assignedResponderNames": [responder["name"]],
             })
 
-        if is_resolved:
+        if status == "resolved":
+
             incident.update({
                 "acknowledgedAt": accepted_at,
                 "acknowledgedVia": "demo_simulation",
@@ -415,10 +509,11 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             })
 
         else:
+
             incident.update({
                 "cancelledAt": cancelled_at,
                 "cancelReason": (
-                    "Synthetic demo cancellation for testing."
+                    "Report cancelled in the demonstration workflow."
                 ),
             })
 
@@ -432,7 +527,7 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# SYNTHETIC SYSTEM LOGS
+# BUILD INCIDENT ACTIVITY LOGS
 # ============================================================
 
 def _build_logs(
@@ -441,12 +536,10 @@ def _build_logs(
     index: int,
 ) -> List[Dict[str, Any]]:
 
-    batch_metadata = {
-        "isSynthetic": True,
-        "demoBatchId": BATCH_ID,
-        "demoSeedVersion": SEED_VERSION,
-    }
+    logs = []
 
+    # All events are attributed to the system.
+    # No real responder is impersonated.
     actor = {
         "uid": "demo-seeder",
         "email": None,
@@ -458,7 +551,12 @@ def _build_logs(
         "id": incident_id,
     }
 
-    logs = []
+    batch_metadata = {
+        "isSynthetic": True,
+        "demoBatchId": BATCH_ID,
+        "demoSeedVersion": SEED_VERSION,
+        "demonstration": True,
+    }
 
     def add_log(
         action: str,
@@ -467,13 +565,14 @@ def _build_logs(
         level: str = "info",
         extra_metadata: Dict[str, Any] = None,
     ):
+
         metadata = dict(batch_metadata)
 
         if extra_metadata:
             metadata.update(extra_metadata)
 
         logs.append({
-            "id": _log_id(index, action.replace(".", "_")),
+            "id": _log_id(index, action),
             "data": {
                 "timestamp": timestamp,
                 "level": level,
@@ -483,17 +582,23 @@ def _build_logs(
                 "actor": actor,
                 "target": target,
                 "metadata": metadata,
-                "userAgent": "RoadRescue Synthetic Demo Seeder",
+                "userAgent": "RoadRescue Demonstration",
                 "demoBatchId": BATCH_ID,
             },
         })
 
+    short_id = incident["shortId"]
+
     created_at = incident["createdAt"]
+
+    verified_at = incident["verifiedAt"]
+
     dispatched_at = incident["dispatchedAt"]
 
+    # Incident received.
     add_log(
         "incident.created",
-        f"Synthetic demo incident {incident['shortId']} created.",
+        f"Incident report {short_id} received.",
         created_at,
         extra_metadata={
             "barangay": incident["barangay"],
@@ -501,12 +606,20 @@ def _build_logs(
         },
     )
 
+    # Report verification.
+    add_log(
+        "incident.verified",
+        f"Incident report {short_id} verified in the demonstration workflow.",
+        verified_at,
+    )
+
+    # Dispatch event.
     add_log(
         "incident.dispatched",
-        f"Synthetic demo incident {incident['shortId']} dispatched.",
+        f"Incident {short_id} routed to the designated response area.",
         dispatched_at,
         extra_metadata={
-            "simulated": True,
+            "demonstration": True,
             "responderUid": incident.get(
                 "assignedResponderUid"
             ),
@@ -514,12 +627,12 @@ def _build_logs(
     )
 
     if incident["status"] == "resolved":
+
         add_log(
             "incident.acknowledged",
-            f"Synthetic demo incident {incident['shortId']} acknowledged.",
+            f"Incident {short_id} acknowledged in the demonstration workflow.",
             incident["acknowledgedAt"],
             extra_metadata={
-                "simulated": True,
                 "method": "demo_simulation",
                 "responseTimeSeconds": incident[
                     "responseTimeSeconds"
@@ -529,11 +642,10 @@ def _build_logs(
 
         add_log(
             "incident.resolved",
-            f"Synthetic demo incident {incident['shortId']} resolved.",
+            f"Incident {short_id} marked as resolved in the demonstration workflow.",
             incident["resolvedAt"],
             level="success",
             extra_metadata={
-                "simulated": True,
                 "respondedDurationSeconds": incident[
                     "respondedDurationSeconds"
                 ],
@@ -541,13 +653,13 @@ def _build_logs(
         )
 
     else:
+
         add_log(
             "incident.cancelled",
-            f"Synthetic demo incident {incident['shortId']} cancelled.",
+            f"Incident report {short_id} marked as cancelled in the demonstration workflow.",
             incident["cancelledAt"],
             level="warn",
             extra_metadata={
-                "simulated": True,
                 "reason": incident["cancelReason"],
             },
         )
@@ -568,10 +680,12 @@ def preview_demo_dataset(
 
     existing_incidents = 0
     incident_collisions = 0
+
     existing_logs = 0
     log_collisions = 0
 
     for item in dataset:
+
         incident_ref = (
             db.collection("incidents")
             .document(item["id"])
@@ -580,6 +694,7 @@ def preview_demo_dataset(
         snap = incident_ref.get()
 
         if snap.exists:
+
             data = snap.to_dict() or {}
 
             if data.get("demoBatchId") == BATCH_ID:
@@ -594,6 +709,7 @@ def preview_demo_dataset(
         )
 
         for log in logs:
+
             log_ref = (
                 db.collection("system_logs")
                 .document(log["id"])
@@ -602,6 +718,7 @@ def preview_demo_dataset(
             log_snap = log_ref.get()
 
             if log_snap.exists:
+
                 log_data = log_snap.to_dict() or {}
 
                 if log_data.get("demoBatchId") == BATCH_ID:
@@ -615,34 +732,44 @@ def preview_demo_dataset(
     )
 
     responder_count = len({
-        r["uid"]
+        responder["uid"]
         for values in responders.values()
-        for r in values
+        for responder in values
     })
 
     return {
         "ok": True,
+
         "batchId": BATCH_ID,
+
         "seedVersion": SEED_VERSION,
+
         "dateRange": {
             "from": START_DATE.date().isoformat(),
             "to": END_DATE.date().isoformat(),
         },
+
         "planned": {
             "incidents": TOTAL_INCIDENTS,
             "resolved": RESOLVED_COUNT,
             "cancelled": CANCELLED_COUNT,
+            "distribution": INCIDENT_DISTRIBUTION,
         },
+
         "existing": {
             "incidents": existing_incidents,
             "logs": existing_logs,
         },
+
         "collisions": {
             "incidents": incident_collisions,
             "logs": log_collisions,
         },
+
         "registeredActiveRespondersFound": responder_count,
+
         "adminUid": admin.get("uid"),
+
         "safeToSeed": (
             incident_collisions == 0
             and log_collisions == 0
@@ -651,7 +778,7 @@ def preview_demo_dataset(
 
 
 # ============================================================
-# SEED
+# SEED DATASET
 # ============================================================
 
 def seed_demo_dataset(
@@ -663,11 +790,17 @@ def seed_demo_dataset(
 
     created_incidents = 0
     skipped_incidents = 0
+
     created_logs = 0
     skipped_logs = 0
 
-    # Check for collisions before writing anything.
+    # --------------------------------------------------------
+    # FIRST PASS: CHECK ALL DOCUMENT COLLISIONS.
+    # No writes are performed until all checks pass.
+    # --------------------------------------------------------
+
     for item in dataset:
+
         snap = (
             db.collection("incidents")
             .document(item["id"])
@@ -675,11 +808,12 @@ def seed_demo_dataset(
         )
 
         if snap.exists:
+
             data = snap.to_dict() or {}
 
             if data.get("demoBatchId") != BATCH_ID:
                 raise RuntimeError(
-                    f"Document collision detected: {item['id']}. "
+                    f"Incident document collision: {item['id']}. "
                     "No data was seeded."
                 )
 
@@ -688,6 +822,7 @@ def seed_demo_dataset(
             item["data"],
             item["index"],
         ):
+
             log_snap = (
                 db.collection("system_logs")
                 .document(log["id"])
@@ -695,16 +830,22 @@ def seed_demo_dataset(
             )
 
             if log_snap.exists:
+
                 log_data = log_snap.to_dict() or {}
 
                 if log_data.get("demoBatchId") != BATCH_ID:
                     raise RuntimeError(
-                        f"Log collision detected: {log['id']}. "
+                        f"System log collision: {log['id']}. "
                         "No data was seeded."
                     )
 
-    # Create incidents and their corresponding logs.
+    # --------------------------------------------------------
+    # SECOND PASS: CREATE INCIDENTS AND LOGS.
+    # Existing documents from this batch are skipped.
+    # --------------------------------------------------------
+
     for item in dataset:
+
         incident_ref = (
             db.collection("incidents")
             .document(item["id"])
@@ -713,8 +854,11 @@ def seed_demo_dataset(
         existing = incident_ref.get()
 
         if existing.exists:
+
             skipped_incidents += 1
+
         else:
+
             incident_ref.create(item["data"])
             created_incidents += 1
 
@@ -725,14 +869,18 @@ def seed_demo_dataset(
         )
 
         for log in logs:
+
             log_ref = (
                 db.collection("system_logs")
                 .document(log["id"])
             )
 
             if log_ref.get().exists:
+
                 skipped_logs += 1
+
             else:
+
                 log_ref.create(log["data"])
                 created_logs += 1
 
@@ -740,22 +888,35 @@ def seed_demo_dataset(
 
     return {
         "ok": True,
-        "message": "Synthetic demo dataset processed.",
+
+        "message": "Demonstration incident dataset processed.",
+
         "batchId": BATCH_ID,
+
         "incidentsCreated": created_incidents,
+
         "incidentsAlreadyExisting": skipped_incidents,
+
         "logsCreated": created_logs,
+
         "logsAlreadyExisting": skipped_logs,
+
         "plannedResolved": RESOLVED_COUNT,
+
         "plannedCancelled": CANCELLED_COUNT,
+
+        "emergencyDistribution": INCIDENT_DISTRIBUTION,
+
         "pushNotificationsSent": 0,
+
         "smsMessagesSent": 0,
+
         "adminUid": admin.get("uid"),
     }
 
 
 # ============================================================
-# CLEANUP
+# DELETE DEMONSTRATION DATASET
 # ============================================================
 
 def delete_demo_dataset(
@@ -768,7 +929,9 @@ def delete_demo_dataset(
     deleted_incidents = 0
     deleted_logs = 0
 
+    # Delete only the exact documents belonging to this batch.
     for item in dataset:
+
         incident_ref = (
             db.collection("incidents")
             .document(item["id"])
@@ -777,13 +940,14 @@ def delete_demo_dataset(
         incident_snap = incident_ref.get()
 
         if incident_snap.exists:
+
             data = incident_snap.to_dict() or {}
 
-            # Never delete a document not owned by this batch.
             if (
                 data.get("isSynthetic") is True
                 and data.get("demoBatchId") == BATCH_ID
             ):
+
                 incident_ref.delete()
                 deleted_incidents += 1
 
@@ -794,6 +958,7 @@ def delete_demo_dataset(
         )
 
         for log in logs:
+
             log_ref = (
                 db.collection("system_logs")
                 .document(log["id"])
@@ -802,9 +967,14 @@ def delete_demo_dataset(
             log_snap = log_ref.get()
 
             if log_snap.exists:
+
                 log_data = log_snap.to_dict() or {}
 
-                if log_data.get("demoBatchId") == BATCH_ID:
+                if (
+                    log_data.get("isSynthetic") is True
+                    and log_data.get("demoBatchId") == BATCH_ID
+                ):
+
                     log_ref.delete()
                     deleted_logs += 1
 
@@ -812,9 +982,14 @@ def delete_demo_dataset(
 
     return {
         "ok": True,
-        "message": "Synthetic demo dataset cleanup completed.",
+
+        "message": "Demonstration incident cleanup completed.",
+
         "batchId": BATCH_ID,
+
         "incidentsDeleted": deleted_incidents,
+
         "logsDeleted": deleted_logs,
+
         "adminUid": admin.get("uid"),
     }
