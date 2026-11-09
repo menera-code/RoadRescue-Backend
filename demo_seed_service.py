@@ -1,21 +1,25 @@
 
 """
-RoadRescue realistic incident demonstration seeder.
+RoadRescue Realistic Incident Demonstration Seeder
+Version: 2.1
 
 Creates:
 - 45 fictional demonstration incidents
 - 36 resolved incidents
 - 9 cancelled incidents
+- 8 actual RoadRescue emergency categories
 - Realistic roadside assistance descriptions
 - Corresponding system_logs entries
 
 Safety:
-- Uses a dedicated deterministic demo batch ID.
-- Does not send SMS or push notifications.
-- Does not impersonate actual responders in activity logs.
-- Uses existing active responder accounts for assignment fields.
+- Dedicated deterministic demo batch ID.
+- No SMS or push notifications.
+- No real responder impersonation in activity logs.
+- Uses existing active responders for assignment fields.
 - Preserves internal demo identification fields.
-- Deletes only records belonging to this exact demo batch.
+- Checks document collisions before writing.
+- Uses atomic Firestore batch writes.
+- Deletes only records belonging to this demo batch.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -39,9 +43,14 @@ TOTAL_INCIDENTS = 45
 RESOLVED_COUNT = 36
 CANCELLED_COUNT = 9
 
-SEED_VERSION = "2.0"
+SEED_VERSION = "2.1"
 
 PH_TIMEZONE = timezone(timedelta(hours=8))
+
+RANDOM_SEED = 20261109
+
+# Firestore batch maximum is 500 operations.
+FIRESTORE_BATCH_LIMIT = 450
 
 
 # ============================================================
@@ -149,7 +158,9 @@ def _clear_analytics_cache() -> None:
         from analytics_service import clear_cache
         clear_cache()
     except Exception as exc:
-        print(f"[demo-seed] Analytics cache clear skipped: {exc}")
+        print(
+            f"[demo-seed] Analytics cache clear skipped: {exc}"
+        )
 
 
 def _get_barangays() -> List[Dict[str, Any]]:
@@ -162,7 +173,55 @@ def _get_barangays() -> List[Dict[str, Any]]:
             "No barangays found in data/barangays.py"
         )
 
+    for barangay in barangays:
+        required = ["name", "slug", "lat", "lng"]
+
+        for field in required:
+            if field not in barangay:
+                raise RuntimeError(
+                    f"Barangay missing required field: {field}"
+                )
+
     return barangays
+
+
+def _get_priority(incident_type: str) -> str:
+    priorities = {
+        "Flat Tire": "low",
+        "Dead Battery": "low",
+        "Out of Fuel": "low",
+        "Stalled": "medium",
+        "Minor Crash": "medium",
+        "Major Crash": "critical",
+        "Vehicle Fire": "critical",
+        "Road Hazard": "medium",
+    }
+
+    return priorities.get(incident_type, "medium")
+
+
+def _validate_configuration() -> None:
+
+    if sum(INCIDENT_DISTRIBUTION.values()) != TOTAL_INCIDENTS:
+        raise RuntimeError(
+            "Emergency category distribution must total 45."
+        )
+
+    if RESOLVED_COUNT + CANCELLED_COUNT != TOTAL_INCIDENTS:
+        raise RuntimeError(
+            "Resolved and cancelled counts must total 45."
+        )
+
+    if START_DATE > END_DATE:
+        raise RuntimeError(
+            "START_DATE cannot be after END_DATE."
+        )
+
+    for category in INCIDENT_DISTRIBUTION:
+        if category not in DESCRIPTIONS:
+            raise RuntimeError(
+                f"Missing descriptions for {category}."
+            )
 
 
 # ============================================================
@@ -174,9 +233,10 @@ def _get_responders_by_barangay(
     barangays: List[Dict[str, Any]],
 ) -> Dict[str, List[Dict[str, Any]]]:
 
-    users_by_uid: Dict[str, Dict[str, Any]] = {}
+    users_by_uid = {}
 
     for doc in db.collection("users").stream():
+
         user = doc.to_dict() or {}
 
         if user.get("role") != "responder":
@@ -194,14 +254,17 @@ def _get_responders_by_barangay(
     result = {}
 
     for barangay in barangays:
+
         name = barangay["name"]
         slug = barangay["slug"]
+
         normalized = _normalize_name(name)
 
         matched = {}
 
         # Match responders through their profiles.
         for uid, user in users_by_uid.items():
+
             assigned = (
                 user.get("assignedBarangay")
                 or user.get("barangay")
@@ -213,6 +276,7 @@ def _get_responders_by_barangay(
 
         # Match responders through barangay documents.
         try:
+
             snapshot = (
                 db.collection("barangays")
                 .document(slug)
@@ -220,12 +284,15 @@ def _get_responders_by_barangay(
             )
 
             if snapshot.exists:
+
                 data = snapshot.to_dict() or {}
 
                 assigned = data.get("responders", [])
 
                 if isinstance(assigned, list):
+
                     for responder in assigned:
+
                         if not isinstance(responder, dict):
                             continue
 
@@ -241,6 +308,7 @@ def _get_responders_by_barangay(
                     matched[legacy_uid] = users_by_uid[legacy_uid]
 
         except Exception as exc:
+
             print(
                 f"[demo-seed] Responder lookup failed "
                 f"for {name}: {exc}"
@@ -262,32 +330,14 @@ def _get_responders_by_barangay(
 
 
 # ============================================================
-# PRIORITY ASSIGNMENT
-# ============================================================
-
-def _get_priority(incident_type: str) -> str:
-
-    priorities = {
-        "Flat Tire": "low",
-        "Dead Battery": "low",
-        "Out of Fuel": "low",
-        "Stalled": "medium",
-        "Minor Crash": "medium",
-        "Major Crash": "critical",
-        "Vehicle Fire": "critical",
-        "Road Hazard": "medium",
-    }
-
-    return priorities.get(incident_type, "medium")
-
-
-# ============================================================
 # BUILD INCIDENT DATASET
 # ============================================================
 
 def _build_dataset(db) -> List[Dict[str, Any]]:
 
-    rng = Random(20261109)
+    _validate_configuration()
+
+    rng = Random(RANDOM_SEED)
 
     barangays = _get_barangays()
 
@@ -295,16 +345,11 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
         _get_responders_by_barangay(db, barangays)
     )
 
-    # Generate the exact emergency category distribution.
+    # Generate exact emergency category distribution.
     incident_types = []
 
     for category, count in INCIDENT_DISTRIBUTION.items():
         incident_types.extend([category] * count)
-
-    if len(incident_types) != TOTAL_INCIDENTS:
-        raise RuntimeError(
-            "Emergency category distribution must total 45."
-        )
 
     rng.shuffle(incident_types)
 
@@ -377,7 +422,7 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             -0.0015, 0.0015
         )
 
-        # Find an existing responder assigned to the barangay.
+        # Find existing responder assigned to barangay.
         assigned_responders = responders_by_barangay.get(
             barangay["slug"],
             [],
@@ -471,14 +516,20 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
         }
 
         if responder:
+
             incident.update({
                 "assignedResponderUid": responder["uid"],
                 "assignedResponderName": responder["name"],
-                "assignedResponderUids": [responder["uid"]],
-                "assignedResponderNames": [responder["name"]],
+                "assignedResponderUids": [
+                    responder["uid"]
+                ],
+                "assignedResponderNames": [
+                    responder["name"]
+                ],
             })
 
         if status == "resolved":
+
             incident.update({
                 "acknowledgedAt": accepted_at,
                 "acknowledgedVia": "demo_simulation",
@@ -489,6 +540,7 @@ def _build_dataset(db) -> List[Dict[str, Any]]:
             })
 
         else:
+
             incident.update({
                 "cancelledAt": cancelled_at,
                 "cancelReason": (
@@ -552,6 +604,7 @@ def _build_logs(
 
         logs.append({
             "id": _log_id(index, action),
+
             "data": {
                 "timestamp": timestamp,
                 "level": level,
@@ -600,7 +653,6 @@ def _build_logs(
         f"Incident {short_id} routed to the designated response area.",
         dispatched_at,
         extra_metadata={
-            "demonstration": True,
             "responderUid": incident.get(
                 "assignedResponderUid"
             ),
@@ -675,9 +727,13 @@ def preview_demo_dataset(
         snap = incident_ref.get()
 
         if snap.exists:
+
             data = snap.to_dict() or {}
 
-            if data.get("demoBatchId") == BATCH_ID:
+            if (
+                data.get("isSynthetic") is True
+                and data.get("demoBatchId") == BATCH_ID
+            ):
                 existing_incidents += 1
             else:
                 incident_collisions += 1
@@ -698,6 +754,7 @@ def preview_demo_dataset(
             log_snap = log_ref.get()
 
             if log_snap.exists:
+
                 log_data = log_snap.to_dict() or {}
 
                 if log_data.get("demoBatchId") == BATCH_ID:
@@ -767,55 +824,18 @@ def seed_demo_dataset(
 
     dataset = _build_dataset(db)
 
-    created_incidents = 0
-    skipped_incidents = 0
+    pending_writes = []
 
-    created_logs = 0
+    skipped_incidents = 0
     skipped_logs = 0
 
+    created_incidents = 0
+    created_logs = 0
+
+    # --------------------------------------------------------
     # FIRST PASS: CHECK ALL DOCUMENT COLLISIONS.
-    # No writes are performed until all checks pass.
-
-    for item in dataset:
-
-        snap = (
-            db.collection("incidents")
-            .document(item["id"])
-            .get()
-        )
-
-        if snap.exists:
-            data = snap.to_dict() or {}
-
-            if data.get("demoBatchId") != BATCH_ID:
-                raise RuntimeError(
-                    f"Incident document collision: {item['id']}. "
-                    "No data was seeded."
-                )
-
-        for log in _build_logs(
-            item["id"],
-            item["data"],
-            item["index"],
-        ):
-
-            log_snap = (
-                db.collection("system_logs")
-                .document(log["id"])
-                .get()
-            )
-
-            if log_snap.exists:
-                log_data = log_snap.to_dict() or {}
-
-                if log_data.get("demoBatchId") != BATCH_ID:
-                    raise RuntimeError(
-                        f"System log collision: {log['id']}. "
-                        "No data was seeded."
-                    )
-
-    # SECOND PASS: CREATE INCIDENTS AND LOGS.
-    # Existing documents from this batch are skipped.
+    # NO WRITES ARE PERFORMED DURING THIS PASS.
+    # --------------------------------------------------------
 
     for item in dataset:
 
@@ -824,13 +844,28 @@ def seed_demo_dataset(
             .document(item["id"])
         )
 
-        existing = incident_ref.get()
+        snap = incident_ref.get()
 
-        if existing.exists:
+        if snap.exists:
+
+            data = snap.to_dict() or {}
+
+            if (
+                data.get("isSynthetic") is not True
+                or data.get("demoBatchId") != BATCH_ID
+            ):
+                raise RuntimeError(
+                    f"Incident document collision: {item['id']}. "
+                    "No data was seeded."
+                )
+
             skipped_incidents += 1
+
         else:
-            incident_ref.create(item["data"])
-            created_incidents += 1
+
+            pending_writes.append(
+                (incident_ref, item["data"], "incident")
+            )
 
         logs = _build_logs(
             item["id"],
@@ -845,11 +880,54 @@ def seed_demo_dataset(
                 .document(log["id"])
             )
 
-            if log_ref.get().exists:
+            log_snap = log_ref.get()
+
+            if log_snap.exists:
+
+                log_data = log_snap.to_dict() or {}
+
+                if log_data.get("demoBatchId") != BATCH_ID:
+                    raise RuntimeError(
+                        f"System log document collision: "
+                        f"{log['id']}. No data was seeded."
+                    )
+
                 skipped_logs += 1
+
             else:
-                log_ref.create(log["data"])
+
+                pending_writes.append(
+                    (log_ref, log["data"], "log")
+                )
+
+    # --------------------------------------------------------
+    # SECOND PASS: ATOMIC FIRESTORE BATCH WRITES.
+    # --------------------------------------------------------
+
+    for start in range(
+        0,
+        len(pending_writes),
+        FIRESTORE_BATCH_LIMIT,
+    ):
+
+        chunk = pending_writes[
+            start:start + FIRESTORE_BATCH_LIMIT
+        ]
+
+        batch = db.batch()
+
+        for ref, data, record_type in chunk:
+
+            # create() prevents overwriting existing documents.
+            batch.create(ref, data)
+
+            if record_type == "incident":
+                created_incidents += 1
+            else:
                 created_logs += 1
+
+        # Firestore commits each chunk atomically.
+        batch.commit()
 
     _clear_analytics_cache()
 
@@ -860,6 +938,8 @@ def seed_demo_dataset(
 
         "batchId": BATCH_ID,
 
+        "seedVersion": SEED_VERSION,
+
         "incidentsCreated": created_incidents,
 
         "incidentsAlreadyExisting": skipped_incidents,
@@ -867,6 +947,8 @@ def seed_demo_dataset(
         "logsCreated": created_logs,
 
         "logsAlreadyExisting": skipped_logs,
+
+        "plannedIncidents": TOTAL_INCIDENTS,
 
         "plannedResolved": RESOLVED_COUNT,
 
@@ -891,57 +973,95 @@ def delete_demo_dataset(
     admin: Dict[str, Any],
 ) -> Dict[str, Any]:
 
-    dataset = _build_dataset(db)
-
     deleted_incidents = 0
     deleted_logs = 0
 
-    # Delete only the exact documents belonging to this batch.
-    for item in dataset:
+    skipped_incidents = 0
+    skipped_logs = 0
 
-        incident_ref = (
-            db.collection("incidents")
-            .document(item["id"])
-        )
+    # --------------------------------------------------------
+    # FIND INCIDENTS USING THE EXACT BATCH ID.
+    # --------------------------------------------------------
 
-        incident_snap = incident_ref.get()
+    incident_docs = (
+        db.collection("incidents")
+        .where("demoBatchId", "==", BATCH_ID)
+        .stream()
+    )
 
-        if incident_snap.exists:
+    pending_deletes = []
 
-            data = incident_snap.to_dict() or {}
+    for doc in incident_docs:
 
-            if (
-                data.get("isSynthetic") is True
-                and data.get("demoBatchId") == BATCH_ID
-            ):
-                incident_ref.delete()
-                deleted_incidents += 1
+        data = doc.to_dict() or {}
 
-        logs = _build_logs(
-            item["id"],
-            item["data"],
-            item["index"],
-        )
+        # Require both ownership markers.
+        if data.get("isSynthetic") is True:
 
-        for log in logs:
-
-            log_ref = (
-                db.collection("system_logs")
-                .document(log["id"])
+            pending_deletes.append(
+                (doc.reference, "incident")
             )
 
-            log_snap = log_ref.get()
+        else:
+            skipped_incidents += 1
 
-            if log_snap.exists:
+    # --------------------------------------------------------
+    # FIND SYSTEM LOGS USING THE EXACT BATCH ID.
+    # --------------------------------------------------------
 
-                log_data = log_snap.to_dict() or {}
+    log_docs = (
+        db.collection("system_logs")
+        .where("demoBatchId", "==", BATCH_ID)
+        .stream()
+    )
 
-                # FIX:
-                # Older logs stored isSynthetic only inside metadata.
-                # The unique batch ID is the ownership check.
-                if log_data.get("demoBatchId") == BATCH_ID:
-                    log_ref.delete()
-                    deleted_logs += 1
+    for doc in log_docs:
+
+        data = doc.to_dict() or {}
+
+        metadata = data.get("metadata") or {}
+
+        # Support both current and legacy log structures.
+        is_synthetic = (
+            data.get("isSynthetic") is True
+            or metadata.get("isSynthetic") is True
+        )
+
+        if is_synthetic:
+
+            pending_deletes.append(
+                (doc.reference, "log")
+            )
+
+        else:
+            skipped_logs += 1
+
+    # --------------------------------------------------------
+    # DELETE IN FIRESTORE BATCHES.
+    # --------------------------------------------------------
+
+    for start in range(
+        0,
+        len(pending_deletes),
+        FIRESTORE_BATCH_LIMIT,
+    ):
+
+        chunk = pending_deletes[
+            start:start + FIRESTORE_BATCH_LIMIT
+        ]
+
+        batch = db.batch()
+
+        for ref, record_type in chunk:
+
+            batch.delete(ref)
+
+            if record_type == "incident":
+                deleted_incidents += 1
+            else:
+                deleted_logs += 1
+
+        batch.commit()
 
     _clear_analytics_cache()
 
@@ -955,6 +1075,95 @@ def delete_demo_dataset(
         "incidentsDeleted": deleted_incidents,
 
         "logsDeleted": deleted_logs,
+
+        "incidentsSkipped": skipped_incidents,
+
+        "logsSkipped": skipped_logs,
+
+        "adminUid": admin.get("uid"),
+    }
+
+
+# ============================================================
+# DATASET VERIFICATION
+# ============================================================
+
+def verify_demo_dataset(
+    db,
+    admin: Dict[str, Any],
+) -> Dict[str, Any]:
+
+    incidents = (
+        db.collection("incidents")
+        .where("demoBatchId", "==", BATCH_ID)
+        .stream()
+    )
+
+    total = 0
+    resolved = 0
+    cancelled = 0
+    invalid = 0
+
+    distribution = {}
+
+    for doc in incidents:
+
+        data = doc.to_dict() or {}
+
+        total += 1
+
+        if data.get("isSynthetic") is not True:
+            invalid += 1
+
+        status = data.get("status")
+
+        if status == "resolved":
+            resolved += 1
+
+        elif status == "cancelled":
+            cancelled += 1
+
+        category = data.get("type", "Unknown")
+
+        distribution[category] = (
+            distribution.get(category, 0) + 1
+        )
+
+    logs = (
+        db.collection("system_logs")
+        .where("demoBatchId", "==", BATCH_ID)
+        .stream()
+    )
+
+    log_count = sum(1 for _ in logs)
+
+    return {
+        "ok": (
+            total == TOTAL_INCIDENTS
+            and resolved == RESOLVED_COUNT
+            and cancelled == CANCELLED_COUNT
+            and invalid == 0
+        ),
+
+        "batchId": BATCH_ID,
+
+        "seedVersion": SEED_VERSION,
+
+        "actual": {
+            "incidents": total,
+            "resolved": resolved,
+            "cancelled": cancelled,
+            "logs": log_count,
+            "invalidSyntheticMarkers": invalid,
+            "distribution": distribution,
+        },
+
+        "expected": {
+            "incidents": TOTAL_INCIDENTS,
+            "resolved": RESOLVED_COUNT,
+            "cancelled": CANCELLED_COUNT,
+            "distribution": INCIDENT_DISTRIBUTION,
+        },
 
         "adminUid": admin.get("uid"),
     }
