@@ -1,184 +1,251 @@
 """
-Firestore worker — listens for new incidents and classifies them.
+Firestore worker — processes new RoadRescue incidents with Gemini.
 
-Runs as a background thread inside the FastAPI process (started at
-app startup in main.py). Idempotent — safe to restart the server any
-number of times.
+Runs as a background thread inside the FastAPI process.
 
-How it works:
-  1. On startup, processes any unprocessed incidents from the backlog
-  2. Subscribes to incidents where status is 'unverified' or 'pending'
-     (i.e. incidents that haven't been dispatched to a responder yet)
-  3. For each incident without an `ml` field, runs predict_incident()
-  4. Writes `ml` + `mlProcessedAt` back to the incident document
+Workflow:
+1. Process existing unclassified incidents on startup.
+2. Listen for new unverified/pending incidents.
+3. Send report text and Firebase Storage photo URLs to predictor.py.
+4. Save the prediction and analysis details in the incident's ml field.
 
-The listener only writes to Firestore; it never touches Firebase Auth
-or Storage.
+The worker does not train models or run a local image-detection model.
 """
 
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from firebase_admin import firestore
 
-# Guard so we don't start the listener twice on --reload
+
 _started = False
 _watch = None
 
-# Statuses the worker cares about — anything not yet dispatched
 WATCHED_STATUSES = ["unverified", "pending"]
+
+
+def _normalize_photo_urls(value: Any) -> List[str]:
+    """Normalize photoUrls into a list of non-empty URL strings."""
+    if isinstance(value, str):
+        value = [value]
+
+    if not isinstance(value, list):
+        return []
+
+    return [
+        url.strip()
+        for url in value
+        if isinstance(url, str) and url.strip()
+    ][:2]
 
 
 def _classify_and_update(db, doc_snapshot) -> None:
     """
-    Classify a single incident and write the ML result back.
+    Classify one incident and save its Gemini analysis.
 
-    Silently skips incidents that:
-      - Already have an `ml` field (already classified)
-      - Are already accepted / in progress / resolved (too late)
-      - Have no description or images to work with
+    Skips incidents that already have an ml result or have moved
+    beyond the unverified/pending stage.
     """
-    from predictor import predict_incident  # local import — keeps startup fast
-
     data = doc_snapshot.to_dict() or {}
 
-    # Skip if already processed
     if data.get("ml"):
         return
 
-    # Skip if the incident has already moved past the unverified/pending stage
     if data.get("status") not in WATCHED_STATUSES:
         return
 
     description = (data.get("description") or "").strip()
     reported_type = data.get("type")
-    image_urls = data.get("photoUrls") or []
+    image_urls = _normalize_photo_urls(data.get("photoUrls"))
 
-    # We can still classify on images alone, but require at least one signal
     if not description and not image_urls:
-        print(f"[worker] skip {doc_snapshot.id}: no description and no images")
+        print(
+            f"[worker] Skipping {doc_snapshot.id}: "
+            "no description or photographs"
+        )
         return
 
-    print(f"[worker] classifying incident {doc_snapshot.id}…")
+    print(f"[worker] Analyzing incident {doc_snapshot.id}...")
 
     try:
+        from predictor import predict_incident
+
         result = predict_incident(
             text=description,
             image_urls=image_urls or None,
         )
-    except Exception as e:
-        print(f"[worker] ❌ predict_incident failed for {doc_snapshot.id}: {e}")
-        # Write an error marker so we don't retry forever
+
+    except Exception as exc:
+        print(
+            f"[worker] Prediction failed for {doc_snapshot.id}: "
+            f"{type(exc).__name__}: {str(exc)[:200]}"
+        )
+
+        # Preserve the existing behavior: mark the failure so the
+        # listener does not repeatedly call Gemini for the same record.
         doc_snapshot.reference.update({
             "ml": {
-                "error": str(e)[:200],
+                "analysisStatus": "failed",
+                "error": str(exc)[:200],
                 "processedAt": firestore.SERVER_TIMESTAMP,
-            },
+            }
         })
         return
 
-    # Compare with what the citizen picked
+    predicted_type = result.get("predicted_type", "other")
+    predicted_severity = result.get("predicted_severity", "medium")
+
     reported_matches = (
-        reported_type == result["predicted_type"]
+        reported_type == predicted_type
         if reported_type
         else None
     )
 
+    image_analysis = result.get("image_analysis") or {}
+
+    if image_analysis.get("images_analyzed", 0) > 0:
+        analysis_status = (
+            "completed_with_image"
+            if not image_analysis.get("errors")
+            else "completed_with_image_warnings"
+        )
+    elif image_urls:
+        analysis_status = "completed_without_image"
+    else:
+        analysis_status = "completed_text_only"
+
     payload: Dict[str, Any] = {
-        "predictedType": result["predicted_type"],
-        "predictedSeverity": result["predicted_severity"],
-        "confidence": result["confidence"],
-        "keywords": result["keywords"],
-        "mentionedVehicles": result["mentioned_vehicles"],
-        "vehicles": result["vehicles"],
-        "allVehicles": result["all_vehicles"],
-        "sources": result["sources"],
+        # Existing fields — preserve dashboard compatibility.
+        "predictedType": predicted_type,
+        "predictedSeverity": predicted_severity,
+        "confidence": result.get("confidence", 0.4),
+        "keywords": result.get("keywords", []),
+        "mentionedVehicles": result.get("mentioned_vehicles", []),
+        "vehicles": result.get("vehicles", {}),
+        "allVehicles": result.get("all_vehicles", []),
+        "sources": result.get("sources", []),
+
+        # Additional Gemini analysis fields.
+        "imageVehicles": result.get("image_vehicles", {}),
+        "detections": result.get("detections", []),
+        "imageAnalysis": image_analysis,
+        "textAnalysis": result.get("text_analysis", {}),
+        "needsHumanReview": result.get("needs_human_review", True),
+        "severityBasis": result.get(
+            "severity_basis", "insufficient_evidence"
+        ),
+        "analysisStatus": analysis_status,
+
+        # Citizen-selected type comparison.
         "reportedType": reported_type,
         "reportedTypeMatches": reported_matches,
+
         "processedAt": firestore.SERVER_TIMESTAMP,
     }
 
-    # Flag disagreements for admin review
     if reported_matches is False:
         payload["mismatch"] = True
 
-    doc_snapshot.reference.update({"ml": payload})
+    # Save all ML results in the existing nested ml field.
+    doc_snapshot.reference.update({
+        "ml": payload,
+    })
+
+    # Invalidate analytics cache after the incident is analyzed.
+    try:
+        from analytics_service import clear_cache
+        clear_cache()
+    except Exception as exc:
+        print(f"[worker] Analytics cache clear skipped: {exc}")
 
     print(
-        f"[worker] ✅ {doc_snapshot.id} → {result['predicted_type']} "
-        f"({result['predicted_severity']}, "
-        f"src={result['sources']}, "
-        f"match={reported_matches})"
+        f"[worker] Completed {doc_snapshot.id}: "
+        f"{predicted_type} / {predicted_severity}; "
+        f"sources={result.get('sources', [])}; "
+        f"image_status={analysis_status}; "
+        f"human_review={result.get('needs_human_review', True)}"
     )
 
 
 def _process_backlog(db) -> None:
-    """Process any unverified/pending incidents that don't have an `ml` field yet."""
+    """Process existing unverified/pending incidents without ml results."""
     try:
-        # Firestore 'in' queries support up to 30 values — 2 is fine
         pending = (
             db.collection("incidents")
             .where("status", "in", WATCHED_STATUSES)
             .stream()
         )
-        count = 0
-        for snap in pending:
-            data = snap.to_dict() or {}
+
+        processed = 0
+
+        for snapshot in pending:
+            data = snapshot.to_dict() or {}
+
             if not data.get("ml"):
-                _classify_and_update(db, snap)
-                count += 1
-        if count:
-            print(f"[worker] backlog processed: {count} incidents")
-    except Exception as e:
-        print(f"[worker] backlog scan failed: {e}")
+                _classify_and_update(db, snapshot)
+                processed += 1
+
+        if processed:
+            print(
+                f"[worker] Backlog scan completed: "
+                f"{processed} incident(s) checked"
+            )
+
+    except Exception as exc:
+        print(f"[worker] Backlog scan failed: {exc}")
 
 
 def _on_snapshot(col_snapshot, changes, read_time):
-    """Firestore listener callback — runs on every change to the query."""
+    """Process newly added incidents matching the watched statuses."""
     db = firestore.client()
+
     for change in changes:
-        # We only care about newly added documents
         if change.type.name != "ADDED":
             continue
+
         _classify_and_update(db, change.document)
 
 
 def start_worker() -> None:
-    """
-    Start the Firestore listener as a background thread.
-    Called once at FastAPI startup. Safe to call multiple times.
-    """
+    """Start the Firestore listener once during FastAPI startup."""
     global _started, _watch
 
     if _started:
         return
-    _started = True
 
     db = firestore.client()
 
-    # 1. Process any existing unprocessed incidents first
+    # Process existing unclassified incidents.
     threading.Thread(
         target=_process_backlog,
         args=(db,),
         daemon=True,
+        name="roadrescue-ml-backlog",
     ).start()
 
-    # 2. Subscribe to new incidents
+    # Listen for newly added incidents.
     query = (
         db.collection("incidents")
         .where("status", "in", WATCHED_STATUSES)
     )
+
     _watch = query.on_snapshot(_on_snapshot)
-    print("[worker] ✅ Firestore listener started")
+    _started = True
+
+    print("[worker] Firestore Gemini analysis listener started")
 
 
 def stop_worker() -> None:
-    """Stop the listener (called at shutdown)."""
+    """Stop the Firestore listener during application shutdown."""
     global _watch, _started
+
     if _watch:
         try:
             _watch.unsubscribe()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[worker] Listener shutdown warning: {exc}")
+
         _watch = None
+
     _started = False
+    print("[worker] Firestore listener stopped")
