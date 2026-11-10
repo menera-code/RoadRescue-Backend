@@ -6,8 +6,9 @@ Runs as a background thread inside the FastAPI process.
 Workflow:
 1. Process existing unclassified incidents on startup.
 2. Listen for new unverified/pending incidents.
-3. Send report text and Firebase Storage photo URLs to predictor.py.
-4. Save the prediction and analysis details in the incident's ml field.
+3. Read report text, Firebase Storage photo URLs, and videoUrl.
+4. Send available media to predictor.py.
+5. Save prediction and analysis details in the incident's ml field.
 
 The worker does not train models or run a local image-detection model.
 """
@@ -24,6 +25,10 @@ _watch = None
 WATCHED_STATUSES = ["unverified", "pending"]
 
 
+# ---------------------------------------------------------------------------
+# INPUT NORMALIZATION
+# ---------------------------------------------------------------------------
+
 def _normalize_photo_urls(value: Any) -> List[str]:
     """Normalize photoUrls into a list of non-empty URL strings."""
     if isinstance(value, str):
@@ -38,6 +43,18 @@ def _normalize_photo_urls(value: Any) -> List[str]:
         if isinstance(url, str) and url.strip()
     ][:2]
 
+
+def _normalize_video_url(value: Any) -> str:
+    """Normalize videoUrl into one non-empty URL string."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# INCIDENT CLASSIFICATION
+# ---------------------------------------------------------------------------
 
 def _classify_and_update(db, doc_snapshot) -> None:
     """
@@ -54,18 +71,37 @@ def _classify_and_update(db, doc_snapshot) -> None:
     if data.get("status") not in WATCHED_STATUSES:
         return
 
-    description = (data.get("description") or "").strip()
-    reported_type = data.get("type")
-    image_urls = _normalize_photo_urls(data.get("photoUrls"))
+    description = (
+        data.get("description") or ""
+    ).strip()
 
-    if not description and not image_urls:
+    reported_type = data.get("type")
+
+    image_urls = _normalize_photo_urls(
+        data.get("photoUrls")
+    )
+
+    video_url = _normalize_video_url(
+        data.get("videoUrl")
+    )
+
+    # Do not skip video-only reports.
+    if not description and not image_urls and not video_url:
         print(
             f"[worker] Skipping {doc_snapshot.id}: "
-            "no description or photographs"
+            "no description, photographs, or video"
         )
         return
 
-    print(f"[worker] Analyzing incident {doc_snapshot.id}...")
+    print(
+        f"[worker] Analyzing incident {doc_snapshot.id}..."
+    )
+
+    print(
+        f"[worker] Media available: "
+        f"photos={len(image_urls)}, "
+        f"video={'yes' if video_url else 'no'}"
+    )
 
     try:
         from predictor import predict_incident
@@ -73,6 +109,7 @@ def _classify_and_update(db, doc_snapshot) -> None:
         result = predict_incident(
             text=description,
             image_urls=image_urls or None,
+            video_url=video_url or None,
         )
 
     except Exception as exc:
@@ -81,8 +118,8 @@ def _classify_and_update(db, doc_snapshot) -> None:
             f"{type(exc).__name__}: {str(exc)[:200]}"
         )
 
-        # Preserve the existing behavior: mark the failure so the
-        # listener does not repeatedly call Gemini for the same record.
+        # Preserve existing behavior: record the failure so the
+        # listener does not repeatedly call Gemini for this record.
         doc_snapshot.reference.update({
             "ml": {
                 "analysisStatus": "failed",
@@ -90,10 +127,18 @@ def _classify_and_update(db, doc_snapshot) -> None:
                 "processedAt": firestore.SERVER_TIMESTAMP,
             }
         })
+
         return
 
-    predicted_type = result.get("predicted_type", "other")
-    predicted_severity = result.get("predicted_severity", "medium")
+    predicted_type = result.get(
+        "predicted_type",
+        "other",
+    )
+
+    predicted_severity = result.get(
+        "predicted_severity",
+        "medium",
+    )
 
     reported_matches = (
         reported_type == predicted_type
@@ -101,38 +146,114 @@ def _classify_and_update(db, doc_snapshot) -> None:
         else None
     )
 
-    image_analysis = result.get("image_analysis") or {}
+    image_analysis = result.get(
+        "image_analysis"
+    ) or {}
 
-    if image_analysis.get("images_analyzed", 0) > 0:
+    video_analysis = result.get(
+        "video_analysis"
+    ) or {
+        "video_received": bool(video_url),
+        "video_analyzed": False,
+        "status": "not_provided" if not video_url else "unknown",
+        "error": None,
+    }
+
+    images_analyzed = image_analysis.get(
+        "images_analyzed",
+        0,
+    )
+
+    video_analyzed = bool(
+        video_analysis.get("video_analyzed")
+    )
+
+    # Determine the overall analysis status.
+    if video_url and video_analyzed:
+        if image_analysis.get("errors"):
+            analysis_status = "completed_with_media_warnings"
+        else:
+            analysis_status = "completed_with_video"
+
+    elif video_url and not video_analyzed:
+        if result.get("sources") and "gemini" in result.get("sources", []):
+            analysis_status = "completed_without_video"
+        else:
+            analysis_status = "completed_with_video_error"
+
+    elif images_analyzed > 0:
         analysis_status = (
             "completed_with_image"
             if not image_analysis.get("errors")
             else "completed_with_image_warnings"
         )
+
     elif image_urls:
         analysis_status = "completed_without_image"
-    else:
+
+    elif result.get("sources") and "gemini" in result.get("sources", []):
         analysis_status = "completed_text_only"
 
+    else:
+        analysis_status = "completed_with_fallback"
+
+    # Preserve existing fields for dashboard compatibility.
     payload: Dict[str, Any] = {
-        # Existing fields — preserve dashboard compatibility.
         "predictedType": predicted_type,
         "predictedSeverity": predicted_severity,
-        "confidence": result.get("confidence", 0.4),
-        "keywords": result.get("keywords", []),
-        "mentionedVehicles": result.get("mentioned_vehicles", []),
-        "vehicles": result.get("vehicles", {}),
-        "allVehicles": result.get("all_vehicles", []),
-        "sources": result.get("sources", []),
+        "confidence": result.get(
+            "confidence",
+            0.4,
+        ),
+        "keywords": result.get(
+            "keywords",
+            [],
+        ),
+        "mentionedVehicles": result.get(
+            "mentioned_vehicles",
+            [],
+        ),
+        "vehicles": result.get(
+            "vehicles",
+            {},
+        ),
+        "allVehicles": result.get(
+            "all_vehicles",
+            [],
+        ),
+        "sources": result.get(
+            "sources",
+            [],
+        ),
 
-        # Additional Gemini analysis fields.
-        "imageVehicles": result.get("image_vehicles", {}),
-        "detections": result.get("detections", []),
+        # Image analysis.
+        "imageVehicles": result.get(
+            "image_vehicles",
+            {},
+        ),
+        "detections": result.get(
+            "detections",
+            [],
+        ),
         "imageAnalysis": image_analysis,
-        "textAnalysis": result.get("text_analysis", {}),
-        "needsHumanReview": result.get("needs_human_review", True),
+
+        # Video analysis.
+        "videoAnalysis": video_analysis,
+
+        # Text analysis.
+        "textAnalysis": result.get(
+            "text_analysis",
+            {},
+        ),
+
+        # Review and severity information.
+        "needsHumanReview": result.get(
+            "needs_human_review",
+            True,
+        ),
         "severityBasis": result.get(
-            "severity_basis", "insufficient_evidence"
+            "severity_basis",
+            "insufficient_evidence",
         ),
         "analysisStatus": analysis_status,
 
@@ -146,7 +267,7 @@ def _classify_and_update(db, doc_snapshot) -> None:
     if reported_matches is False:
         payload["mismatch"] = True
 
-    # Save all ML results in the existing nested ml field.
+    # Save all results inside the existing nested ml field.
     doc_snapshot.reference.update({
         "ml": payload,
     })
@@ -155,20 +276,30 @@ def _classify_and_update(db, doc_snapshot) -> None:
     try:
         from analytics_service import clear_cache
         clear_cache()
+
     except Exception as exc:
-        print(f"[worker] Analytics cache clear skipped: {exc}")
+        print(
+            f"[worker] Analytics cache clear skipped: {exc}"
+        )
 
     print(
         f"[worker] Completed {doc_snapshot.id}: "
         f"{predicted_type} / {predicted_severity}; "
         f"sources={result.get('sources', [])}; "
-        f"image_status={analysis_status}; "
+        f"analysis_status={analysis_status}; "
+        f"video_analyzed={video_analyzed}; "
         f"human_review={result.get('needs_human_review', True)}"
     )
 
 
+# ---------------------------------------------------------------------------
+# BACKLOG PROCESSING
+# ---------------------------------------------------------------------------
+
 def _process_backlog(db) -> None:
-    """Process existing unverified/pending incidents without ml results."""
+    """
+    Process existing unverified/pending incidents without ml results.
+    """
     try:
         pending = (
             db.collection("incidents")
@@ -192,19 +323,32 @@ def _process_backlog(db) -> None:
             )
 
     except Exception as exc:
-        print(f"[worker] Backlog scan failed: {exc}")
+        print(
+            f"[worker] Backlog scan failed: {exc}"
+        )
 
+
+# ---------------------------------------------------------------------------
+# FIRESTORE SNAPSHOT LISTENER
+# ---------------------------------------------------------------------------
 
 def _on_snapshot(col_snapshot, changes, read_time):
-    """Process newly added incidents matching the watched statuses."""
+    """Process newly added incidents matching watched statuses."""
     db = firestore.client()
 
     for change in changes:
         if change.type.name != "ADDED":
             continue
 
-        _classify_and_update(db, change.document)
+        _classify_and_update(
+            db,
+            change.document,
+        )
 
+
+# ---------------------------------------------------------------------------
+# WORKER STARTUP AND SHUTDOWN
+# ---------------------------------------------------------------------------
 
 def start_worker() -> None:
     """Start the Firestore listener once during FastAPI startup."""
@@ -230,9 +374,12 @@ def start_worker() -> None:
     )
 
     _watch = query.on_snapshot(_on_snapshot)
+
     _started = True
 
-    print("[worker] Firestore Gemini analysis listener started")
+    print(
+        "[worker] Firestore Gemini text/image/video listener started"
+    )
 
 
 def stop_worker() -> None:
@@ -242,10 +389,16 @@ def stop_worker() -> None:
     if _watch:
         try:
             _watch.unsubscribe()
+
         except Exception as exc:
-            print(f"[worker] Listener shutdown warning: {exc}")
+            print(
+                f"[worker] Listener shutdown warning: {exc}"
+            )
 
         _watch = None
 
     _started = False
-    print("[worker] Firestore listener stopped")
+
+    print(
+        "[worker] Firestore listener stopped"
+    )
