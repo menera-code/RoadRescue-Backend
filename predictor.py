@@ -1,37 +1,32 @@
 """
 RoadRescue incident classifier.
 
-Combines two signals:
-  1. Gemini — text classification of the citizen's free-text description
-     (handles English, Tagalog, and Taglish)
-  2. YOLOv8 — object detection on incident photos
+Uses Google's pretrained Gemini 2.5 Flash model for:
+- Incident classification
+- Severity estimation
+- Vehicle identification from incident photographs
+- Vehicle mentions in English, Tagalog, and Taglish reports
 
-Both are optional at runtime: if one fails, the other still produces a result.
-If both fail, a keyword-based fallback runs.
-
-Output is aligned with the frontend's 8 road-incident types:
-  flat_tire, battery, fuel, stalled_vehicle,
-  minor_collision, major_collision, vehicle_fire, road_hazard
-
-Plus `other` as the catch-all.
+No local YOLO model or model training is required.
 """
 
 import json
+import math
 import os
 import re
-import tempfile
 from typing import Any, Dict, List, Optional
-
-import numpy as np
-import cv2
-from PIL import Image
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 # ---------------------------------------------------------------------------
-# CONSTANTS — defined at top so they're available everywhere
+# CONSTANTS
 # ---------------------------------------------------------------------------
 
-# Road-focused incident types (must match the frontend `TYPES` array in
-# src/views/dashboards/citizen/ReportTab.vue)
 ROAD_INCIDENT_TYPES = [
     "flat_tire",
     "battery",
@@ -46,105 +41,373 @@ ROAD_INCIDENT_TYPES = [
 
 SEVERITY_LEVELS = ["low", "medium", "high", "critical"]
 
-# Human-readable labels for the Gemini prompt
+VEHICLE_TYPES = {
+    "car",
+    "truck",
+    "bus",
+    "motorcycle",
+    "bicycle",
+    "jeepney",
+    "tricycle",
+    "van",
+    "pickup",
+    "suv",
+}
+
 TYPE_LABELS = {
-    "flat_tire":       "flat tire / punctured tire / blown out tire",
-    "battery":         "dead battery / won't start / jump start needed",
-    "fuel":            "out of fuel / ran out of gas",
-    "stalled_vehicle": "stalled / broken down / engine died / won't move",
-    "minor_collision": "minor crash / fender bender / low-speed collision",
-    "major_collision": "major crash / serious accident / multiple vehicles / injuries",
-    "vehicle_fire":    "vehicle on fire / burning car or motorcycle",
-    "road_hazard":     "pothole / debris / fallen tree / flooding / road obstruction",
-    "other":           "anything else that doesn't fit above",
+    "flat_tire": "flat tire, punctured tire, or blown tire",
+    "battery": "dead battery or vehicle will not start",
+    "fuel": "out of fuel or ran out of gasoline",
+    "stalled_vehicle": "stalled vehicle, breakdown, or engine failure",
+    "minor_collision": "minor crash or low-speed collision",
+    "major_collision": "major crash, serious collision, or multiple vehicles",
+    "vehicle_fire": "vehicle fire or burning vehicle",
+    "road_hazard": "pothole, debris, fallen tree, flooding, or road obstruction",
+    "other": "incident that does not fit the other categories",
 }
 
-# YOLO vehicle classes we care about
-VEHICLE_CLASSES = {
-    "car", "truck", "bus", "motorcycle", "bicycle",
-    "suv", "van", "pickup", "jeep", "lorry",
+# Limit image processing to control API usage and memory on Render.
+MAX_IMAGES = 2
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
+IMAGE_TIMEOUT_SECONDS = 12
+
+# Only accept Firebase / Google Cloud Storage download hosts.
+ALLOWED_IMAGE_HOSTS = {
+    "firebasestorage.googleapis.com",
+    "storage.googleapis.com",
 }
 
-# Lazy-loaded YOLO model
-_yolo_model = None
+ALLOWED_IMAGE_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+}
 
 
-# ===========================================================================
-# GEMINI TEXT CLASSIFICATION
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# FIREBASE STORAGE IMAGE DOWNLOAD
+# ---------------------------------------------------------------------------
 
-def classify_text_with_gemini(text: str) -> Dict[str, Any]:
+def _validate_image_url(url: str) -> None:
+    """Reject non-HTTPS URLs and hosts outside Firebase / GCS."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Image URL is empty")
+
+    parsed = urlsplit(url.strip())
+
+    if parsed.scheme != "https":
+        raise ValueError("Only HTTPS image URLs are accepted")
+
+    if parsed.hostname not in ALLOWED_IMAGE_HOSTS:
+        raise ValueError("Image URL is not from an approved Firebase Storage host")
+
+    if parsed.username or parsed.password:
+        raise ValueError("Image URL credentials are not allowed")
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    """Validate redirect destinations before following them."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_image_url(newurl)
+        return super().redirect_request(
+            req, fp, code, msg, headers, newurl
+        )
+
+
+def _download_firebase_image(url: str):
     """
-    Call Gemini to classify a free-text incident description.
+    Download one Firebase Storage image into memory.
 
-    Returns a dict with:
-        type, severity, confidence, keywords, mentioned_vehicles, source
+    Returns (image_bytes, mime_type).
+    Does not save images to Render's filesystem.
+    """
+    _validate_image_url(url)
 
-    Raises on failure so the caller can fall back to keywords.
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "RoadRescue-Backend/1.0",
+            "Accept": "image/jpeg,image/png,image/webp,image/gif",
+        },
+    )
+
+    opener = build_opener(_SafeRedirectHandler())
+
+    with opener.open(request, timeout=IMAGE_TIMEOUT_SECONDS) as response:
+        _validate_image_url(response.geturl())
+
+        content_type = (
+            response.headers.get("Content-Type", "")
+            .split(";")[0]
+            .strip()
+            .lower()
+        )
+
+        if content_type not in ALLOWED_IMAGE_MIME_TYPES:
+            raise ValueError(f"Unsupported image type: {content_type or 'unknown'}")
+
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > MAX_IMAGE_BYTES:
+            raise ValueError("Image exceeds the 4 MB limit")
+
+        image_bytes = response.read(MAX_IMAGE_BYTES + 1)
+
+    if not image_bytes:
+        raise ValueError("Downloaded image is empty")
+
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError("Image exceeds the 4 MB limit")
+
+    return image_bytes, content_type
+
+
+def _load_images(image_urls: Optional[List[str]]):
+    """
+    Download at most MAX_IMAGES images.
+
+    Failed downloads are recorded without exposing signed URLs.
+    """
+    image_parts = []
+    errors = []
+
+    for index, url in enumerate((image_urls or [])[:MAX_IMAGES]):
+        try:
+            image_bytes, mime_type = _download_firebase_image(url)
+
+            # Gemini SDK accepts inline image data in this format.
+            image_parts.append({
+                "mime_type": mime_type,
+                "data": image_bytes,
+            })
+
+        except Exception as exc:
+            print(
+                f"[image] Could not load image {index + 1}: "
+                f"{type(exc).__name__}: {str(exc)[:160]}"
+            )
+            errors.append({
+                "image_index": index,
+                "error": str(exc)[:160],
+            })
+
+    return image_parts, errors
+
+
+# ---------------------------------------------------------------------------
+# JSON AND VALUE VALIDATION
+# ---------------------------------------------------------------------------
+
+def _parse_json_from_llm(raw: str) -> Dict[str, Any]:
+    """Extract JSON from a Gemini response."""
+    cleaned = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        (raw or "").strip(),
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        data = json.loads(match.group(0))
+        if isinstance(data, dict):
+            return data
+
+    raise ValueError("Gemini did not return valid JSON")
+
+
+def _safe_confidence(value: Any, default: float = 0.5) -> float:
+    """Keep model-reported confidence within the 0–1 range."""
+    try:
+        number = float(value)
+        if not math.isfinite(number):
+            return default
+        return round(max(0.0, min(1.0, number)), 3)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_vehicle(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+
+    vehicle = value.strip().lower()
+
+    aliases = {
+        "motorbike": "motorcycle",
+        "motorbike/scooter": "motorcycle",
+        "bike": "bicycle",
+        "jeep": "jeepney",
+        "trike": "tricycle",
+        "lorry": "truck",
+    }
+
+    vehicle = aliases.get(vehicle, vehicle)
+
+    return vehicle if vehicle in VEHICLE_TYPES else None
+
+
+def _clean_string_list(value: Any, limit: int = 5) -> List[str]:
+    if not isinstance(value, list):
+        return []
+
+    cleaned = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            cleaned.append(item.strip().lower()[:60])
+
+    return list(dict.fromkeys(cleaned))[:limit]
+
+
+def _normalize_image_vehicles(value: Any):
+    """Validate Gemini's vehicle counts and confidence values."""
+    vehicles: Dict[str, int] = {}
+    detections: List[Dict[str, Any]] = []
+
+    if not isinstance(value, list):
+        return vehicles, detections
+
+    for item in value[:20]:
+        if not isinstance(item, dict):
+            continue
+
+        vehicle = _normalize_vehicle(item.get("type"))
+        if not vehicle:
+            continue
+
+        try:
+            count = int(item.get("count", 1))
+        except (TypeError, ValueError):
+            count = 1
+
+        count = max(1, min(count, 20))
+        vehicles[vehicle] = vehicles.get(vehicle, 0) + count
+
+        detections.append({
+            "object": vehicle,
+            "count": count,
+            "confidence": _safe_confidence(item.get("confidence")),
+            "source": "gemini_vision",
+        })
+
+    return vehicles, detections
+
+
+# ---------------------------------------------------------------------------
+# GEMINI MULTIMODAL ANALYSIS
+# ---------------------------------------------------------------------------
+
+def classify_with_gemini(
+    text: str,
+    image_parts: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Analyze report text and optional photographs with Gemini 2.5 Flash.
+
+    This is inference using Google's pretrained model. RoadRescue does
+    not train or fine-tune the model.
     """
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set")
+        raise RuntimeError("GEMINI_API_KEY is not configured")
 
-    # Import lazily so the module loads fast even if unused
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.5-flash")
 
-    # Build a road-focused prompt
     type_list = "\n".join(
-        f'  - "{key}": {label}'
+        f'- "{key}": {label}'
         for key, label in TYPE_LABELS.items()
     )
 
-    prompt = f"""You are an incident classifier for RoadRescue, a Philippine road-safety app.
-Classify the following citizen report and return ONLY valid JSON.
+    report_text = (text or "").strip() or "[No written description provided]"
 
-Report (may be in English, Tagalog, or Taglish):
-\"\"\"{text}\"\"\"
+    prompt = f"""
+You are the incident-analysis assistant for RoadRescue,
+a Philippine road-safety and roadside-assistance application.
 
-Choose ONE incident type from this list:
+Analyze the citizen report and any attached incident photographs.
+
+REPORT:
+{report_text}
+
+Choose exactly ONE incident type:
 {type_list}
 
-Choose ONE severity:
-  - "low":      cosmetic, no hazard, minor inconvenience
-  - "medium":   vehicle can't move, needs assistance, no injuries
-  - "high":     collision with possible injury, fire, or blocking traffic
-  - "critical": serious injuries, major collision, fire spreading, or life-threatening
+Choose exactly ONE severity:
+- "low": minor inconvenience with no apparent serious hazard
+- "medium": vehicle breakdown or assistance needed, with no reported serious injury
+- "high": serious collision, significant road obstruction, or credible indication of injury
+- "critical": explicit life-threatening emergency, serious reported injuries,
+  or clearly visible vehicle fire
 
-Also extract:
-  - keywords: up to 5 important words from the report (lowercase)
-  - mentioned_vehicles: any vehicle types mentioned (e.g. ["car", "motorcycle"])
-  - confidence: 0.0 to 1.0 — how sure you are of the type
+IMPORTANT SAFETY RULES:
+1. Do not invent injuries, casualties, or facts not present in the report.
+2. Do not claim that a person is injured just because they are lying down
+   or appear near a vehicle in a photograph.
+3. Use the written report as the primary evidence for injury severity.
+4. Photographs may help identify visible vehicles and visible hazards.
+5. If evidence is insufficient, choose "medium" and set
+   "needs_human_review" to true.
+6. Do not guess a vehicle type if it is not clearly visible.
+7. Do not return bounding boxes or claim exact object-detection coordinates.
+8. A vehicle count is an estimate, not a guaranteed exact count.
+9. The confidence value is your own estimate, not a statistically
+   calibrated probability.
 
-Return JSON EXACTLY like this (no markdown, no commentary):
+Extract:
+- keywords: up to 5 important report keywords
+- mentioned_vehicles: vehicle types explicitly mentioned in the text
+- image_vehicles: vehicle types clearly visible in the photographs,
+  with estimated count and confidence
+- visual_observations: up to 5 short observations supported by the images
+- needs_human_review: true if evidence is uncertain or severity needs verification
+
+Use these vehicle labels where applicable:
+car, truck, bus, motorcycle, bicycle, jeepney, tricycle, van, pickup, suv.
+
+Return ONLY valid JSON in this structure:
 {{
   "type": "major_collision",
   "severity": "high",
-  "confidence": 0.92,
-  "keywords": ["truck", "motorcycle", "collision"],
-  "mentioned_vehicles": ["truck", "motorcycle"]
+  "confidence": 0.80,
+  "keywords": ["collision", "motorcycle"],
+  "mentioned_vehicles": ["motorcycle"],
+  "image_vehicles": [
+    {{"type": "motorcycle", "count": 1, "confidence": 0.85}}
+  ],
+  "visual_observations": ["A motorcycle is visible near the roadside."],
+  "needs_human_review": true
 }}
 """
 
+    contents = [prompt] + (image_parts or [])
+
     response = model.generate_content(
-        prompt,
+        contents,
         generation_config={
             "temperature": 0.1,
-            "max_output_tokens": 2000,   # ← was 800; Gemini 2.5 uses thinking tokens
+            "max_output_tokens": 1200,
             "response_mime_type": "application/json",
-        },  
+        },
     )
 
     raw = (response.text or "").strip()
-
-    # Debug: log the raw response so we can see what Gemini actually sent
-    print(f"[gemini] raw response: {raw[:300]}")
+    if not raw:
+        raise ValueError("Gemini returned an empty response")
 
     data = _parse_json_from_llm(raw)
 
-    # Validate the type is one we accept
     incident_type = data.get("type", "other")
     if incident_type not in ROAD_INCIDENT_TYPES:
         incident_type = "other"
@@ -153,295 +416,233 @@ Return JSON EXACTLY like this (no markdown, no commentary):
     if severity not in SEVERITY_LEVELS:
         severity = "medium"
 
+    mentioned_vehicles = []
+    for vehicle in data.get("mentioned_vehicles", []):
+        normalized = _normalize_vehicle(vehicle)
+        if normalized and normalized not in mentioned_vehicles:
+            mentioned_vehicles.append(normalized)
+
+    image_vehicles, detections = _normalize_image_vehicles(
+        data.get("image_vehicles")
+    )
+
+    observations = _clean_string_list(
+        data.get("visual_observations"), limit=5
+    )
+
     return {
         "type": incident_type,
         "severity": severity,
-        "confidence": float(data.get("confidence", 0.5)),
-        "keywords": list(data.get("keywords", []))[:5],
-        "mentioned_vehicles": list(data.get("mentioned_vehicles", [])),
+        "confidence": _safe_confidence(data.get("confidence")),
+        "keywords": _clean_string_list(data.get("keywords"), limit=5),
+        "mentioned_vehicles": mentioned_vehicles,
+        "image_vehicles": image_vehicles,
+        "detections": detections,
+        "visual_observations": observations,
+        "needs_human_review": bool(data.get("needs_human_review", False)),
         "source": "gemini",
     }
 
 
-def _parse_json_from_llm(raw: str) -> Dict[str, Any]:
-    """
-    Robustly extract JSON from an LLM response.
-
-    Handles:
-      - ```json ... ``` fences (case-insensitive)
-      - ``` ... ``` bare fences
-      - Leading/trailing prose
-      - Trailing newlines / whitespace
-    """
-    # Strip markdown fences (case-insensitive)
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-
-    # Try direct parse
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # Fallback: extract the first {...} block
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError(f"Could not parse JSON from LLM response: {raw[:200]}")
-
-
-# ===========================================================================
+# ---------------------------------------------------------------------------
 # KEYWORD FALLBACK
-# ===========================================================================
+# ---------------------------------------------------------------------------
 
 def classify_text_with_keywords(text: str) -> Dict[str, Any]:
-    """
-    Simple keyword-based classifier. Used when Gemini is unavailable.
-    Fast, offline, deterministic — but less accurate.
-    """
+    """Offline fallback when Gemini is unavailable."""
     t = (text or "").lower()
 
-    # Detect vehicles mentioned
     vehicle_map = {
-        "car":        ["car", "sedan", "suv", "van"],
-        "truck":      ["truck", "lorry", "dump truck"],
-        "motorcycle": ["motorcycle", "motorbike", "scooter", "motor", "bike"],
-        "bus":        ["bus", "minibus"],
-        "jeepney":    ["jeepney", "jeep"],
-        "tricycle":   ["tricycle", "trike"],
+        "car": ["car", "sedan", "suv"],
+        "truck": ["truck", "lorry", "dump truck"],
+        "motorcycle": ["motorcycle", "motorbike", "scooter", "motor"],
+        "bus": ["bus", "minibus"],
+        "jeepney": ["jeepney", "jeep"],
+        "tricycle": ["tricycle", "trike"],
+        "van": ["van"],
+        "pickup": ["pickup"],
     }
-    mentioned_vehicles = [
-        vt for vt, words in vehicle_map.items()
-        if any(w in t for w in words)
+
+    mentioned = [
+        vehicle
+        for vehicle, words in vehicle_map.items()
+        if any(word in t for word in words)
     ]
 
-    # Detect type — ordered by priority (most severe first)
     if any(k in t for k in ["on fire", "burning", "nasusunog", "sunog"]):
-        return _result("vehicle_fire", "critical", 0.75, mentioned_vehicles)
+        return _keyword_result("vehicle_fire", "critical", mentioned)
 
-    if any(k in t for k in ["major", "malaking", "grabe", "critical", "severe",
-                            "multiple vehicles", "injuries", "nasugatan"]):
-        return _result("major_collision", "high", 0.7, mentioned_vehicles)
+    if any(k in t for k in [
+        "major", "malaking", "grabe", "critical", "severe",
+        "multiple vehicles", "injuries", "nasugatan",
+    ]):
+        return _keyword_result("major_collision", "high", mentioned)
 
-    if any(k in t for k in ["collision", "crash", "accident", "bangga",
-                            "bumangga", "sagasa", "rear-ended"]):
-        return _result("minor_collision", "medium", 0.65, mentioned_vehicles)
+    if any(k in t for k in [
+        "collision", "crash", "accident", "bangga",
+        "bumangga", "sagasa", "rear-ended",
+    ]):
+        return _keyword_result("minor_collision", "medium", mentioned)
 
-    if any(k in t for k in ["flat", "punctured", "blown", "butas",
-                            "flat tire", "sabog ang gulong"]):
-        return _result("flat_tire", "low", 0.75, mentioned_vehicles)
+    if any(k in t for k in [
+        "flat", "punctured", "blown", "butas", "sabog ang gulong",
+    ]):
+        return _keyword_result("flat_tire", "low", mentioned)
 
-    if any(k in t for k in ["battery", "baterya", "won't start",
-                            "dead battery", "ayaw mag-start"]):
-        return _result("battery", "low", 0.75, mentioned_vehicles)
+    if any(k in t for k in [
+        "battery", "baterya", "won't start", "dead battery",
+        "ayaw mag-start",
+    ]):
+        return _keyword_result("battery", "low", mentioned)
 
-    if any(k in t for k in ["out of fuel", "no gas", "ubos ang gas",
-                            "empty tank", "naubusan ng gasolina"]):
-        return _result("fuel", "low", 0.75, mentioned_vehicles)
+    if any(k in t for k in ["out of fuel", "no gas", "ubos ang gas"]):
+        return _keyword_result("fuel", "low", mentioned)
 
-    if any(k in t for k in ["stalled", "breakdown", "broken down",
-                            "engine died", "tirik", "ayaw umandar"]):
-        return _result("stalled_vehicle", "medium", 0.7, mentioned_vehicles)
+    if any(k in t for k in [
+        "stalled", "breakdown", "broken down", "engine died",
+        "tirik", "ayaw umandar",
+    ]):
+        return _keyword_result("stalled_vehicle", "medium", mentioned)
 
-    if any(k in t for k in ["pothole", "lubak", "debris", "fallen tree",
-                            "flood", "baha", "obstruction", "road block"]):
-        return _result("road_hazard", "medium", 0.7, mentioned_vehicles)
+    if any(k in t for k in [
+        "pothole", "lubak", "debris", "fallen tree",
+        "flood", "baha", "obstruction", "road block",
+    ]):
+        return _keyword_result("road_hazard", "medium", mentioned)
 
-    return _result("other", "medium", 0.4, mentioned_vehicles)
+    return _keyword_result("other", "medium", mentioned)
 
 
-def _result(type_: str, severity: str, confidence: float,
-            mentioned_vehicles: List[str]) -> Dict[str, Any]:
+def _keyword_result(
+    incident_type: str,
+    severity: str,
+    mentioned_vehicles: List[str],
+) -> Dict[str, Any]:
     return {
-        "type": type_,
+        "type": incident_type,
         "severity": severity,
-        "confidence": confidence,
+        "confidence": 0.4,
         "keywords": [],
         "mentioned_vehicles": mentioned_vehicles,
+        "image_vehicles": {},
+        "detections": [],
+        "visual_observations": [],
+        "needs_human_review": True,
         "source": "keyword",
     }
 
 
-# ===========================================================================
-# YOLO IMAGE ANALYSIS
-# ===========================================================================
-
-def get_yolo_model():
-    """Lazy-load YOLOv8n. Downloads on first run (~6MB), then cached."""
-    global _yolo_model
-    if _yolo_model is None:
-        print("[YOLO] Loading yolov8n.pt (first run may download)...")
-        from ultralytics import YOLO
-        _yolo_model = YOLO("yolov8n.pt")
-        _yolo_model.to("cpu")
-        print("[YOLO] Model loaded.")
-    return _yolo_model
-
-
-def extract_vehicles(detections: List[Dict]) -> Dict[str, int]:
-    """Count vehicle detections by class."""
-    vehicles: Dict[str, int] = {}
-    for d in detections:
-        obj = (d.get("object") or "").lower()
-        if obj in VEHICLE_CLASSES:
-            vehicles[obj] = vehicles.get(obj, 0) + 1
-    return vehicles
-
-
-def analyze_image(image_path: str) -> Optional[Dict[str, Any]]:
-    """
-    Run YOLOv8 on a single image. Returns detection summary or None on error.
-    """
-    if not os.path.exists(image_path):
-        print(f"[YOLO] image not found: {image_path}")
-        return None
-
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            # PIL fallback
-            arr = np.array(Image.open(image_path).convert("RGB"))
-            img = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-
-        img = cv2.resize(img, (640, 640))
-
-        model = get_yolo_model()
-        results = model(img, verbose=False)
-
-        detections: List[Dict[str, Any]] = []
-        for r in results:
-            boxes = r.boxes
-            if boxes is None:
-                continue
-            for box in boxes:
-                cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                name = model.names[cls_id]
-                detections.append({
-                    "object": name,
-                    "confidence": round(conf, 3),
-                    "class_id": cls_id,
-                })
-
-        vehicles = extract_vehicles(detections)
-
-        return {
-            "detections": detections,
-            "vehicles": vehicles,
-            "total_objects": len(detections),
-            "confidence": max((d["confidence"] for d in detections), default=0.5),
-        }
-    except Exception as e:
-        print(f"[YOLO] image analysis failed: {e}")
-        return None
-
-
-# ===========================================================================
-# TOP-LEVEL: COMBINE SIGNALS
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# TOP-LEVEL PREDICTION
+# ---------------------------------------------------------------------------
 
 def predict_incident(
     text: str,
     image_urls: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Main entry point called by the FastAPI endpoint.
+    Analyze one RoadRescue incident.
 
-    Args:
-        text: citizen's free-text description
-        image_urls: optional list of image URLs (Firebase Storage download URLs)
-
-    Returns a dict:
-        {
-          "predicted_type": "major_collision",
-          "predicted_severity": "high",
-          "confidence": 0.92,
-          "keywords": [...],
-          "mentioned_vehicles": [...],
-          "detections": [...],
-          "vehicles": {...},
-          "sources": ["gemini", "yolo"],   # which signals fired
-          "text_analysis": {...},           # raw gemini/keyword result
-          "image_analysis": {...},          # raw YOLO result (or null)
-        }
+    Existing response fields are retained for backend compatibility.
+    Additional fields distinguish text and image analysis.
     """
-    sources: List[str] = []
+    text = (text or "").strip()
 
-    # ----- Text analysis -----
-    text_result: Dict[str, Any] = {}
-    if text and len(text.strip()) >= 3:
-        try:
-            text_result = classify_text_with_gemini(text)
-            sources.append("gemini")
-        except Exception as e:
-            print(f"[predict] Gemini failed ({e}); falling back to keywords")
-            text_result = classify_text_with_keywords(text)
-            sources.append("keyword")
+    image_parts, image_errors = _load_images(image_urls)
+
+    if not text and not image_parts:
+        text_result = _keyword_result("other", "medium", [])
+        text_result["confidence"] = 0.3
+        text_result["source"] = "empty"
     else:
-        text_result = {
-            "type": "other",
-            "severity": "medium",
-            "confidence": 0.3,
-            "keywords": [],
-            "mentioned_vehicles": [],
-            "source": "empty",
+        try:
+            text_result = classify_with_gemini(
+                text=text,
+                image_parts=image_parts,
+            )
+        except Exception as exc:
+            print(
+                f"[predict] Gemini analysis failed: "
+                f"{type(exc).__name__}: {str(exc)[:200]}"
+            )
+            text_result = classify_text_with_keywords(text)
+
+    image_vehicles = text_result.get("image_vehicles", {})
+    mentioned_vehicles = text_result.get("mentioned_vehicles", [])
+
+    # Keep the legacy `vehicles` field useful for existing analytics.
+    vehicles = image_vehicles or {
+        vehicle: 1 for vehicle in mentioned_vehicles
+    }
+
+    all_vehicles = sorted(
+        set(list(image_vehicles.keys()) + list(mentioned_vehicles))
+    )
+
+    sources = []
+    if text_result.get("source") == "gemini":
+        sources.append("gemini")
+        if image_parts:
+            sources.append("gemini_vision")
+    elif text_result.get("source") == "keyword":
+        sources.append("keyword")
+    else:
+        sources.append("empty")
+
+    image_analysis = None
+    if image_parts or image_errors:
+        image_analysis = {
+            "vehicles": image_vehicles,
+            "detections": text_result.get("detections", []),
+            "observations": text_result.get("visual_observations", []),
+            "images_received": len(image_urls or []),
+            "images_analyzed": (
+                len(image_parts)
+                if text_result.get("source") == "gemini"
+                else 0
+            ),
+            "errors": image_errors,
         }
-
-    # ----- Image analysis -----
-    image_result: Optional[Dict[str, Any]] = None
-    if image_urls:
-        # For Phase A we only handle local paths.
-        # Phase B adds Firebase Storage download → temp file.
-        for url in image_urls[:3]:  # cap at 3 images
-            result = analyze_image(url)
-            if result:
-                image_result = result
-                sources.append("yolo")
-                break
-
-    # ----- Combine -----
-    vehicles_from_image = (image_result or {}).get("vehicles", {})
-    vehicles_from_text = set(text_result.get("mentioned_vehicles", []))
-    all_vehicles = list(set(list(vehicles_from_image.keys()) + list(vehicles_from_text)))
-
-    # Gemini's type wins; YOLO adds detail but doesn't override
-    final_type = text_result.get("type", "other")
-    final_severity = text_result.get("severity", "medium")
-
-    # Boost severity if YOLO detected fire
-    if image_result and any(
-        (d.get("object") or "").lower() in ("fire", "smoke")
-        for d in image_result.get("detections", [])
-    ):
-        final_type = "vehicle_fire"
-        final_severity = "critical"
 
     return {
-        "predicted_type": final_type,
-        "predicted_severity": final_severity,
-        "confidence": text_result.get("confidence", 0.5),
+        "predicted_type": text_result.get("type", "other"),
+        "predicted_severity": text_result.get("severity", "medium"),
+        "confidence": text_result.get("confidence", 0.4),
         "keywords": text_result.get("keywords", []),
-        "mentioned_vehicles": text_result.get("mentioned_vehicles", []),
-        "detections": (image_result or {}).get("detections", []),
-        "vehicles": vehicles_from_image or {
-            v: 1 for v in vehicles_from_text
-        },
+        "mentioned_vehicles": mentioned_vehicles,
+        "image_vehicles": image_vehicles,
+        "detections": text_result.get("detections", []),
+        "vehicles": vehicles,
         "all_vehicles": all_vehicles,
         "sources": sources,
+        "needs_human_review": text_result.get(
+            "needs_human_review", True
+        ),
+        "severity_basis": (
+            "text_and_image" if text and image_parts
+            else "text" if text
+            else "image" if image_parts
+            else "insufficient_evidence"
+        ),
         "text_analysis": text_result,
-        "image_analysis": image_result,
+        "image_analysis": image_analysis,
     }
 
 
 if __name__ == "__main__":
-    # Quick CLI test: python predictor.py "car crash on the highway"
     import sys
     from dotenv import load_dotenv
+
     load_dotenv()
 
-    sample = sys.argv[1] if len(sys.argv) > 1 else "nagkaroon ng banggaan sa highway, may nasugatan"
-    print(json.dumps(predict_incident(sample), indent=2))
+    sample = (
+        " ".join(sys.argv[1:])
+        if len(sys.argv) > 1
+        else "Nagkaroon ng banggaan sa highway, may nasugatan."
+    )
+
+    print(json.dumps(
+        predict_incident(sample),
+        indent=2,
+        ensure_ascii=False,
+    ))
