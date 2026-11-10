@@ -4,15 +4,13 @@ pydantic>=2.9,<3.0
 python-dotenv>=1.0,<2.0
 firebase-admin>=6.5,<7.0
 
-# ML / image processing
+# Gemini AI
 google-generativeai>=0.8,<1.0
-ultralytics>=8.3,<9.0
-opencv-python-headless>=4.10,<5.0
-Pillow>=11.0,<12.0
-numpy>=2.0,<3.0
 
+# Email and Web Push notifications
 email-validator>=2.0,<3.0
 pywebpush==2.0.3
 py-vapid==1.9.1
 
+# Philippine Standard Geographic Code
 psgc[geo]
