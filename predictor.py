@@ -1,3 +1,4 @@
+
 """
 RoadRescue incident classifier.
 
@@ -6,7 +7,7 @@ Uses Google's pretrained Gemini 2.5 Flash model for:
 - Severity estimation
 - Vehicle identification from photographs
 - Incident video understanding
-- Vehicle mentions in English, Tagalog, and Taglish reports
+- English, Tagalog, and Taglish reports
 
 No local YOLO model or model training is required.
 """
@@ -25,6 +26,7 @@ from urllib.request import (
     Request,
     build_opener,
 )
+
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -69,18 +71,15 @@ TYPE_LABELS = {
     "other": "incident that does not fit the other categories",
 }
 
-# Image processing limits
 MAX_IMAGES = 2
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 IMAGE_TIMEOUT_SECONDS = 12
 
-# Video processing limits
 MAX_VIDEO_BYTES = 50 * 1024 * 1024
 VIDEO_TIMEOUT_SECONDS = 30
 VIDEO_PROCESSING_TIMEOUT_SECONDS = 120
 VIDEO_POLL_INTERVAL_SECONDS = 5
 
-# Only accept Firebase / Google Cloud Storage download hosts.
 ALLOWED_IMAGE_HOSTS = {
     "firebasestorage.googleapis.com",
     "storage.googleapis.com",
@@ -115,6 +114,7 @@ ALLOWED_VIDEO_MIME_TYPES = {
 
 def _validate_storage_url(url: str, allowed_hosts: set) -> None:
     """Reject non-HTTPS URLs and hosts outside Firebase / GCS."""
+
     if not isinstance(url, str) or not url.strip():
         raise ValueError("Storage URL is empty")
 
@@ -124,7 +124,9 @@ def _validate_storage_url(url: str, allowed_hosts: set) -> None:
         raise ValueError("Only HTTPS Storage URLs are accepted")
 
     if parsed.hostname not in allowed_hosts:
-        raise ValueError("URL is not from an approved Firebase Storage host")
+        raise ValueError(
+            "URL is not from an approved Firebase Storage host"
+        )
 
     if parsed.username or parsed.password:
         raise ValueError("URL credentials are not allowed")
@@ -160,6 +162,7 @@ def _download_firebase_image(url: str):
 
     Returns (image_bytes, mime_type).
     """
+
     _validate_storage_url(url, ALLOWED_IMAGE_HOSTS)
 
     request = Request(
@@ -172,7 +175,11 @@ def _download_firebase_image(url: str):
 
     opener = build_opener(_SafeImageRedirectHandler())
 
-    with opener.open(request, timeout=IMAGE_TIMEOUT_SECONDS) as response:
+    with opener.open(
+        request,
+        timeout=IMAGE_TIMEOUT_SECONDS,
+    ) as response:
+
         _validate_storage_url(
             response.geturl(),
             ALLOWED_IMAGE_HOSTS,
@@ -212,6 +219,7 @@ def _load_images(image_urls: Optional[List[str]]):
 
     Failed downloads are recorded without exposing signed URLs.
     """
+
     image_parts = []
     errors = []
 
@@ -249,6 +257,7 @@ def _download_firebase_video(url: str):
     Returns (video_bytes, mime_type).
     Enforces the 50 MB limit.
     """
+
     _validate_storage_url(url, ALLOWED_VIDEO_HOSTS)
 
     request = Request(
@@ -261,7 +270,11 @@ def _download_firebase_video(url: str):
 
     opener = build_opener(_SafeVideoRedirectHandler())
 
-    with opener.open(request, timeout=VIDEO_TIMEOUT_SECONDS) as response:
+    with opener.open(
+        request,
+        timeout=VIDEO_TIMEOUT_SECONDS,
+    ) as response:
+
         _validate_storage_url(
             response.geturl(),
             ALLOWED_VIDEO_HOSTS,
@@ -300,16 +313,23 @@ def _download_firebase_video(url: str):
 # ---------------------------------------------------------------------------
 
 def _parse_json_from_llm(raw: str) -> Dict[str, Any]:
-    """Extract JSON from a Gemini response."""
+    """Safely extract a JSON object from a Gemini response."""
+
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("Gemini returned an empty response")
+
+    cleaned = raw.strip()
+
     cleaned = re.sub(
         r"^```(?:json)?\s*",
         "",
-        (raw or "").strip(),
+        cleaned,
         flags=re.IGNORECASE,
     )
 
     cleaned = re.sub(r"\s*```$", "", cleaned)
 
+    # First, try parsing the entire response.
     try:
         data = json.loads(cleaned)
 
@@ -319,19 +339,139 @@ def _parse_json_from_llm(raw: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    # Extract a JSON object while respecting quoted strings.
+    start = cleaned.find("{")
 
-    if match:
-        data = json.loads(match.group(0))
+    if start == -1:
+        raise ValueError(
+            f"No JSON object found: {cleaned[:500]}"
+        )
 
-        if isinstance(data, dict):
-            return data
+    depth = 0
+    in_string = False
+    escaped = False
 
-    raise ValueError("Gemini did not return valid JSON")
+    for index in range(start, len(cleaned)):
+        char = cleaned[index]
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+
+            continue
+
+        if char == '"':
+            in_string = True
+
+        elif char == "{":
+            depth += 1
+
+        elif char == "}":
+            depth -= 1
+
+            if depth == 0:
+                candidate = cleaned[start:index + 1]
+
+                try:
+                    data = json.loads(candidate)
+
+                    if isinstance(data, dict):
+                        return data
+
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Gemini returned malformed JSON: {exc}"
+                    ) from exc
+
+    raise ValueError(
+        f"Gemini returned incomplete JSON: {cleaned[:1000]}"
+    )
+
+
+def _extract_gemini_response(response) -> str:
+    """
+    Extract readable text from Gemini's response.
+
+    Logs candidate finish reasons to diagnose blocked,
+    incomplete, or truncated responses.
+    """
+
+    candidates = getattr(response, "candidates", None) or []
+
+    for index, candidate in enumerate(candidates):
+        finish_reason = getattr(candidate, "finish_reason", None)
+
+        safety_ratings = getattr(
+            candidate,
+            "safety_ratings",
+            None,
+        )
+
+        print(
+            f"[gemini] Candidate {index} finish_reason: "
+            f"{finish_reason}"
+        )
+
+        if safety_ratings:
+            print(
+                f"[gemini] Candidate {index} safety_ratings: "
+                f"{safety_ratings}"
+            )
+
+    # Try the SDK's normal response.text property.
+    try:
+        raw = response.text
+
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+
+    except Exception as exc:
+        print(
+            "[gemini] response.text extraction failed: "
+            f"{type(exc).__name__}: {str(exc)[:300]}"
+        )
+
+    # Try extracting text directly from candidate parts.
+    extracted_parts = []
+
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+
+        if not content:
+            continue
+
+        parts = getattr(content, "parts", None) or []
+
+        for part in parts:
+            part_text = getattr(part, "text", None)
+
+            if isinstance(part_text, str) and part_text.strip():
+                extracted_parts.append(part_text.strip())
+
+    if extracted_parts:
+        return "\n".join(extracted_parts)
+
+    prompt_feedback = getattr(
+        response,
+        "prompt_feedback",
+        None,
+    )
+
+    print(f"[gemini] Prompt feedback: {prompt_feedback}")
+    print(f"[gemini] Candidate count: {len(candidates)}")
+
+    raise ValueError(
+        "Gemini returned no readable response text"
+    )
 
 
 def _safe_confidence(value: Any, default: float = 0.5) -> float:
     """Keep model-reported confidence within the 0–1 range."""
+
     try:
         number = float(value)
 
@@ -379,6 +519,7 @@ def _clean_string_list(value: Any, limit: int = 5) -> List[str]:
 
 def _normalize_image_vehicles(value: Any):
     """Validate Gemini's vehicle counts and confidence values."""
+
     vehicles: Dict[str, int] = {}
     detections: List[Dict[str, Any]] = []
 
@@ -431,6 +572,7 @@ def classify_with_gemini(
     Uses Google's pretrained Gemini 2.5 Flash model.
     RoadRescue does not train or fine-tune the model.
     """
+
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
 
     if not api_key:
@@ -523,6 +665,7 @@ Return ONLY valid JSON in this structure:
 
     uploaded_video = None
     temporary_video_path = None
+    response = None
 
     try:
         if video_bytes:
@@ -597,56 +740,88 @@ Return ONLY valid JSON in this structure:
             contents,
             generation_config={
                 "temperature": 0.1,
-                "max_output_tokens": 1200,
+                "max_output_tokens": 2048,
                 "response_mime_type": "application/json",
             },
         )
 
     finally:
         # Remove the temporary file from Render.
-        if temporary_video_path and os.path.exists(temporary_video_path):
+        if (
+            temporary_video_path
+            and os.path.exists(temporary_video_path)
+        ):
             try:
                 os.remove(temporary_video_path)
+
             except OSError as exc:
                 print(
-                    f"[video] Temporary file cleanup failed: {exc}"
+                    f"[video] Temporary file cleanup failed: "
+                    f"{type(exc).__name__}: {str(exc)[:160]}"
                 )
 
         # Delete the temporary Gemini upload after processing.
         if uploaded_video:
             try:
                 genai.delete_file(uploaded_video.name)
+
             except Exception as exc:
                 print(
                     f"[video] Gemini file cleanup skipped: "
                     f"{type(exc).__name__}: {str(exc)[:120]}"
                 )
 
-    raw = (response.text or "").strip()
+    if response is None:
+        raise RuntimeError("Gemini did not return a response")
 
-    if not raw:
-        raise ValueError("Gemini returned an empty response")
+    raw = _extract_gemini_response(response)
 
-    data = _parse_json_from_llm(raw)
+    print(f"[gemini] Raw response length: {len(raw)}")
+    print(f"[gemini] Raw response preview: {repr(raw[:2000])}")
 
+    try:
+        data = _parse_json_from_llm(raw)
+
+    except Exception as exc:
+        print(
+            f"[gemini] JSON parsing failed: "
+            f"{type(exc).__name__}: {str(exc)[:300]}"
+        )
+
+        print(
+            f"[gemini] Complete response: {repr(raw[:5000])}"
+        )
+
+        raise
+
+    # Validate incident type.
     incident_type = data.get("type", "other")
 
     if incident_type not in ROAD_INCIDENT_TYPES:
         incident_type = "other"
 
+    # Validate severity.
     severity = data.get("severity", "medium")
 
     if severity not in SEVERITY_LEVELS:
         severity = "medium"
 
+    # Normalize mentioned vehicles.
     mentioned_vehicles = []
 
-    for vehicle in data.get("mentioned_vehicles", []):
-        normalized = _normalize_vehicle(vehicle)
+    mentioned_data = data.get("mentioned_vehicles", [])
 
-        if normalized and normalized not in mentioned_vehicles:
-            mentioned_vehicles.append(normalized)
+    if isinstance(mentioned_data, list):
+        for vehicle in mentioned_data:
+            normalized = _normalize_vehicle(vehicle)
 
+            if (
+                normalized
+                and normalized not in mentioned_vehicles
+            ):
+                mentioned_vehicles.append(normalized)
+
+    # Normalize image/video vehicles.
     image_vehicles, detections = _normalize_image_vehicles(
         data.get("image_vehicles")
     )
@@ -683,12 +858,18 @@ Return ONLY valid JSON in this structure:
 
 def classify_text_with_keywords(text: str) -> Dict[str, Any]:
     """Offline fallback when Gemini is unavailable."""
+
     t = (text or "").lower()
 
     vehicle_map = {
         "car": ["car", "sedan", "suv"],
         "truck": ["truck", "lorry", "dump truck"],
-        "motorcycle": ["motorcycle", "motorbike", "scooter", "motor"],
+        "motorcycle": [
+            "motorcycle",
+            "motorbike",
+            "scooter",
+            "motor",
+        ],
         "bus": ["bus", "minibus"],
         "jeepney": ["jeepney", "jeep"],
         "tricycle": ["tricycle", "trike"],
@@ -710,23 +891,37 @@ def classify_text_with_keywords(text: str) -> Dict[str, Any]:
         )
 
     if any(k in t for k in [
-        "major", "malaking", "grabe", "critical", "severe",
-        "multiple vehicles", "injuries", "nasugatan",
+        "major",
+        "malaking",
+        "grabe",
+        "critical",
+        "severe",
+        "multiple vehicles",
+        "injuries",
+        "nasugatan",
     ]):
         return _keyword_result(
             "major_collision", "high", mentioned
         )
 
     if any(k in t for k in [
-        "collision", "crash", "accident", "bangga",
-        "bumangga", "sagasa", "rear-ended",
+        "collision",
+        "crash",
+        "accident",
+        "bangga",
+        "bumangga",
+        "sagasa",
+        "rear-ended",
     ]):
         return _keyword_result(
             "minor_collision", "medium", mentioned
         )
 
     if any(k in t for k in [
-        "flat", "punctured", "blown", "butas",
+        "flat",
+        "punctured",
+        "blown",
+        "butas",
         "sabog ang gulong",
     ]):
         return _keyword_result(
@@ -734,7 +929,10 @@ def classify_text_with_keywords(text: str) -> Dict[str, Any]:
         )
 
     if any(k in t for k in [
-        "battery", "baterya", "won't start", "dead battery",
+        "battery",
+        "baterya",
+        "won't start",
+        "dead battery",
         "ayaw mag-start",
     ]):
         return _keyword_result(
@@ -742,23 +940,35 @@ def classify_text_with_keywords(text: str) -> Dict[str, Any]:
         )
 
     if any(k in t for k in [
-        "out of fuel", "no gas", "ubos ang gas"
+        "out of fuel",
+        "no gas",
+        "ubos ang gas",
     ]):
         return _keyword_result(
             "fuel", "low", mentioned
         )
 
     if any(k in t for k in [
-        "stalled", "breakdown", "broken down", "engine died",
-        "tirik", "ayaw umandar",
+        "stalled",
+        "breakdown",
+        "broken down",
+        "engine died",
+        "tirik",
+        "ayaw umandar",
     ]):
         return _keyword_result(
             "stalled_vehicle", "medium", mentioned
         )
 
     if any(k in t for k in [
-        "pothole", "lubak", "debris", "fallen tree",
-        "flood", "baha", "obstruction", "road block",
+        "pothole",
+        "lubak",
+        "debris",
+        "fallen tree",
+        "flood",
+        "baha",
+        "obstruction",
+        "road block",
     ]):
         return _keyword_result(
             "road_hazard", "medium", mentioned
@@ -772,6 +982,7 @@ def _keyword_result(
     severity: str,
     mentioned_vehicles: List[str],
 ) -> Dict[str, Any]:
+
     return {
         "type": incident_type,
         "severity": severity,
@@ -808,6 +1019,7 @@ def predict_incident(
 
     Existing response fields are retained for backend compatibility.
     """
+
     text = (text or "").strip()
 
     image_parts, image_errors = _load_images(image_urls)
@@ -816,6 +1028,7 @@ def predict_incident(
     video_mime_type = None
     video_error = None
 
+    # Download incident video if supplied.
     if video_url:
         try:
             video_bytes, video_mime_type = (
@@ -832,6 +1045,7 @@ def predict_incident(
                 "error": str(exc)[:160]
             }
 
+    # Handle reports with no usable evidence.
     if not text and not image_parts and not video_bytes:
         text_result = _keyword_result(
             "other",
@@ -857,8 +1071,8 @@ def predict_incident(
                 f"{type(exc).__name__}: {str(exc)[:200]}"
             )
 
-            # If video processing failed, retry Gemini without video.
-            # This preserves text and photo analysis.
+            # If video analysis fails, retry Gemini without video.
+            # This preserves text and photograph analysis.
             if video_bytes:
                 video_error = {
                     "error": (
@@ -901,7 +1115,7 @@ def predict_incident(
         "mentioned_vehicles", []
     )
 
-    # Keep the legacy `vehicles` field useful for analytics.
+    # Keep the legacy vehicles field useful for analytics.
     vehicles = image_vehicles or {
         vehicle: 1
         for vehicle in mentioned_vehicles
@@ -914,6 +1128,7 @@ def predict_incident(
         )
     )
 
+    # Record the analysis sources.
     sources = []
 
     if text_result.get("source") == "gemini":
@@ -931,6 +1146,7 @@ def predict_incident(
     else:
         sources.append("empty")
 
+    # Build image analysis result.
     image_analysis = None
 
     if image_parts or image_errors:
@@ -951,6 +1167,7 @@ def predict_incident(
             "errors": image_errors,
         }
 
+    # Build video analysis result.
     video_analysis = {
         "video_received": bool(video_url),
         "video_downloaded": bool(video_bytes),
@@ -965,28 +1182,39 @@ def predict_incident(
 
     if video_analysis["video_analyzed"]:
         video_analysis["status"] = "completed"
+
     elif video_url:
         video_analysis["status"] = "failed"
+
     else:
         video_analysis["status"] = "not_provided"
 
+    # Determine evidence used for severity classification.
     if text and image_parts and video_analysis["video_analyzed"]:
         severity_basis = "text_image_and_video"
+
     elif text and video_analysis["video_analyzed"]:
         severity_basis = "text_and_video"
+
     elif image_parts and video_analysis["video_analyzed"]:
         severity_basis = "image_and_video"
+
     elif video_analysis["video_analyzed"]:
         severity_basis = "video"
+
     elif text and image_parts:
         severity_basis = "text_and_image"
+
     elif text:
         severity_basis = "text"
+
     elif image_parts:
         severity_basis = "image"
+
     else:
         severity_basis = "insufficient_evidence"
 
+    # Preserve existing response structure for backend compatibility.
     return {
         "predicted_type": text_result.get(
             "type", "other"
